@@ -39,16 +39,10 @@
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="small.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
     <Image Include="MapPackSyncTool.ico">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="MapPackSyncTool_bg_transparent.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
-    <Image Include="MapPackSyncTool_bg_f9f1f0.ico">
+    <Image Include="MapPackSyncTool_Small.ico">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>

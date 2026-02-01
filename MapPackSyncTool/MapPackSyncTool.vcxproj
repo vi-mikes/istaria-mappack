@@ -168,9 +168,7 @@
   </ItemGroup>
   <ItemGroup>
     <Image Include="MapPackSyncTool.ico" />
-    <Image Include="MapPackSyncTool_bg_f9f1f0.ico" />
-    <Image Include="MapPackSyncTool_bg_transparent.ico" />
-    <Image Include="small.ico" />
+    <Image Include="MapPackSyncTool_Small.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

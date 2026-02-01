@@ -353,9 +353,7 @@ static void FreezeProgressOnCancel(AppState* st)
 	SendMessageW(st->hProgress, PBM_SETRANGE32, 0, total);
 	SendMessageW(st->hProgress, PBM_SETPOS, total, 0);
 }
-// --------------------------------------------------
-// UI output helpers (main thread)
-// --------------------------------------------------
+
 // --------------------------------------------------
 // UI output helpers (main thread)
 // --------------------------------------------------
@@ -1074,7 +1072,8 @@ namespace AppConstants
 	static constexpr long kManifestTimeoutSec = 120L;
 	static constexpr long kFileConnectTimeoutMs = 15000L;
 	static constexpr long kFileTimeoutMs = 0L;
-	static constexpr const char* kUserAgent = "MapPackSyncTool by Cegaiel/1.0";
+	static constexpr const char* kUserAgent = "MapPackSyncTool by Cegaiel";
+	static constexpr const wchar_t* kUserAgentW = L"MapPackSyncTool by Cegaiel";
 }
 struct WinHttpHandleDeleter { void operator()(HINTERNET h) const noexcept { if (h) WinHttpCloseHandle(h); } };
 using WinHttpHandle = std::unique_ptr<void, WinHttpHandleDeleter>;
@@ -2302,7 +2301,9 @@ static void StartRemoveIfNotRunning()
 }
 
 // --------------------------------------------------
-// Check if a process is running by executable name
+// Check if a process is running by executable name.
+// Verify if istaria.exe is running. If true abort and give error.
+// If we need to update ClientPrefs_Common.def then it would get undone when user exits Istaria.
 // --------------------------------------------------
 static bool IsProcessRunningByName(const wchar_t* exeName)
 {
@@ -2434,7 +2435,7 @@ static bool WinHttpDownloadUrlToFile(const wchar_t* url, const fs::path& outFile
 	if (uc.lpszExtraInfo && uc.dwExtraInfoLength)
 		path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
 
-	HINTERNET hSession = WinHttpOpen(L"MapPackSyncTool/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	HINTERNET hSession = WinHttpOpen(AppConstants::kUserAgentW, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!hSession) { outErr = L"WinHttpOpen failed"; return false; }
 	ScopeExit closeSession{ [&]() { WinHttpCloseHandle(hSession); } };
 
@@ -2530,7 +2531,7 @@ static bool WinHttpDownloadUrlToUtf8String(const wchar_t* url, std::string& out,
 	path.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
 	if (uc.lpszExtraInfo && uc.dwExtraInfoLength) path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
 
-	HINTERNET hSession = WinHttpOpen(L"MapPackSyncTool/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	HINTERNET hSession = WinHttpOpen(AppConstants::kUserAgentW, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!hSession) { outErr = L"WinHttpOpen failed"; return false; }
 	ScopeExit closeSession{ [&]() { WinHttpCloseHandle(hSession); } };
 
