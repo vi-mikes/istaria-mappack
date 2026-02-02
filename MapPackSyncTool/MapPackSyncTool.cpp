@@ -19,8 +19,8 @@ Notes
 */
 
 //////////////////////////////////////////////////////
-// Comment this out to suppress some local testing messages
-#define DEBUG_MESSAGE
+// Comment this out to suppress some local testing messages and/or presets
+// #define DEBUG_MESSAGE
 //////////////////////////////////////////////////////
 
 #define WIN32_LEAN_AND_MEAN
@@ -46,6 +46,7 @@ Notes
 #include <unordered_set>
 #include <atomic>
 #include <cstring>     // memcpy
+#include <cstdint>
 #include <functional>  // std::function
 #include <memory>      // std::unique_ptr
 #include <winhttp.h>
@@ -60,10 +61,53 @@ namespace fs = std::filesystem;
 // App identity (window title)
 // --------------------------------------------------
 #define MAP_PACK_SYNC_TOOL_NAME    L"MapPack Sync Tool"
-#define MAP_PACK_SYNC_TOOL_VERSION L"v0.0.1"
+#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.1"
+
+static inline std::wstring GetDisplayVersion()
+{
+	return L"v" + std::wstring(MAP_PACK_SYNC_TOOL_VERSION);
+}
 
 static const std::wstring kWindowTitle =
-std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + MAP_PACK_SYNC_TOOL_VERSION;
+std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + GetDisplayVersion();
+
+namespace AppConstants
+{
+	static constexpr long kManifestConnectTimeoutSec = 15L;
+	static constexpr long kManifestTimeoutSec = 120L;
+	static constexpr long kFileConnectTimeoutMs = 15000L;
+	static constexpr long kFileTimeoutMs = 0L;
+	// We are defining this twice because WinHttp expects wide
+	static constexpr const char* kUserAgent = "MapPackSyncTool by Cegaiel";
+	static constexpr const wchar_t* kUserAgentW = L"MapPackSyncTool by Cegaiel";
+}
+struct WinHttpHandleDeleter { void operator()(HINTERNET h) const noexcept { if (h) WinHttpCloseHandle(h); } };
+using WinHttpHandle = std::unique_ptr<void, WinHttpHandleDeleter>;
+
+// --------------------------------------------------
+// Global Remote config (manifest + root)
+// --------------------------------------------------
+static constexpr const char* kRemoteHost = "https://istaria-mappack.s3.us-west-2.amazonaws.com";
+static constexpr const char* kRemoteRootPath = "/resources_override/";
+static constexpr const char* kManifestPath = "/mappack_manifest.json";
+static constexpr const char* kManifestOldPath = "/mappack_manifest_old.json";
+static constexpr const wchar_t* kUpdateExeUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/MapPackSyncTool.exe";
+static constexpr const wchar_t* kUpdateVersionUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/version.txt";
+
+// --------------------------------------------------
+// Global UI layout (initial size + margins)
+// --------------------------------------------------
+static const int MAIN_WINDOW_WIDTH = 825;  // initial window width
+static const int MAIN_WINDOW_HEIGHT = 800;   // initial window height
+// RichEdit margins (client area)
+static const int OUTPUT_MARGIN_LEFT = 10;
+static const int OUTPUT_MARGIN_TOP = 95;
+static const int OUTPUT_MARGIN_RIGHT = 10;
+static const int OUTPUT_MARGIN_BOTTOM = 10;
+// Minimum client size (prevents resizing too small)
+static const int MIN_CLIENT_W = 825;
+static const int MIN_CLIENT_H = MAIN_WINDOW_HEIGHT;
+
 // --------------------------------------------------
 // Small RAII helpers (Win32 resources)
 // --------------------------------------------------
@@ -136,28 +180,7 @@ struct unique_heap_wstr
 	wchar_t* release() { wchar_t* tmp = p; p = nullptr; return tmp; }
 	explicit operator bool() const { return p != nullptr; }
 };
-// --------------------------------------------------
-// Global UI layout (initial size + margins)
-// --------------------------------------------------
-static const int MAIN_WINDOW_WIDTH = 825;  // initial window width
-static const int MAIN_WINDOW_HEIGHT = 800;   // initial window height
-// RichEdit margins (client area)
-static const int OUTPUT_MARGIN_LEFT = 10;
-static const int OUTPUT_MARGIN_TOP = 95;
-static const int OUTPUT_MARGIN_RIGHT = 10;
-static const int OUTPUT_MARGIN_BOTTOM = 10;
-// Minimum client size (prevents resizing too small)
-static const int MIN_CLIENT_W = 825;
-static const int MIN_CLIENT_H = MAIN_WINDOW_HEIGHT;
-// --------------------------------------------------
-// Remote config (manifest + root)
-// --------------------------------------------------
-static constexpr const char* kRemoteHost = "https://istaria-mappack.s3.us-west-2.amazonaws.com";
-static constexpr const char* kRemoteRootPath = "/resources_override/";
-static constexpr const char* kManifestPath = "/mappack_manifest.json";
-static constexpr const char* kManifestOldPath = "/mappack_manifest_old.json";
-static constexpr const wchar_t* kUpdateExeUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/MapPackSyncTool.exe";
-static constexpr const wchar_t* kUpdateVersionUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/version.txt";
+
 // --------------------------------------------------
 // Main window state (UI handles + worker-thread coordination)
 // --------------------------------------------------
@@ -196,6 +219,59 @@ static AppState* g_state = nullptr;
 static HANDLE g_hSingleInstanceMutex = nullptr;
 // Remember the last directory used by the Save Log dialog.
 static std::wstring g_lastSaveDir;
+
+// Forward declarations used before their definitions.
+static fs::path GetThisExePath();
+static void TrimInPlace(std::wstring& s);
+static void StripSurroundingQuotes(std::wstring& s);
+
+// --------------------------------------------------
+// Settings persistence (portable INI next to EXE)
+// - Remembers the last selected Istaria base folder.
+// --------------------------------------------------
+static const wchar_t* kSettingsIniName = L"MapPackSyncTool.ini";
+static const wchar_t* kIniSectionSettings = L"Settings";
+static const wchar_t* kIniKeyLastFolder = L"LastFolder";
+
+static std::wstring GetSettingsIniPath()
+{
+	// Portable: store settings INI next to the EXE.
+	wchar_t exePathW[MAX_PATH]{};
+	DWORD n = GetModuleFileNameW(nullptr, exePathW, (DWORD)_countof(exePathW));
+	if (n == 0 || n >= _countof(exePathW))
+		return std::wstring(kSettingsIniName); // fallback: current working dir
+
+	fs::path exePath(exePathW);
+	fs::path iniPath = exePath.parent_path() / kSettingsIniName;
+	return iniPath.wstring();
+}
+
+
+static std::wstring IniReadLastFolder()
+{
+	wchar_t buf[4096]{};
+	const std::wstring iniPath = GetSettingsIniPath();
+	// If file/key doesn't exist, this returns empty string.
+	GetPrivateProfileStringW(kIniSectionSettings, kIniKeyLastFolder, L"", buf, (DWORD)_countof(buf), iniPath.c_str());
+	std::wstring out(buf);
+	TrimInPlace(out);
+	StripSurroundingQuotes(out);
+	return out;
+}
+
+static void IniWriteLastFolder(const std::wstring& folder)
+{
+	std::wstring v = folder;
+	TrimInPlace(v);
+	StripSurroundingQuotes(v);
+	if (v.empty())
+		return;
+	const std::wstring iniPath = GetSettingsIniPath();
+	// This creates the INI if it doesn't exist yet.
+	WritePrivateProfileStringW(kIniSectionSettings, kIniKeyLastFolder, v.c_str(), iniPath.c_str());
+}
+
+
 struct CancelToken
 {
 	std::atomic_bool* flag = nullptr;
@@ -302,6 +378,7 @@ static constexpr UINT WM_APP_PROGRESS_SET = WM_APP + 13;  // wParam = current (0
 static constexpr UINT WM_APP_PROGRESS_TEXT = WM_APP + 14; // lParam = wchar_t* (HeapAlloc), UI frees
 // Worker completion message (main thread only)
 static constexpr UINT WM_APP_WORKER_DONE = WM_APP + 20;
+
 // --------------------------------------------------
 // PROGRESS BAR (FIXED: dynamic marquee style toggle)
 // --------------------------------------------------
@@ -357,7 +434,6 @@ static void FreezeProgressOnCancel(AppState* st)
 // --------------------------------------------------
 // UI output helpers (main thread)
 // --------------------------------------------------
-
 static std::wstring GetOutputTextW()
 {
 	if (!g_state || !g_state->hOutput) return L"";
@@ -520,32 +596,15 @@ static void SaveOutputToFile()
 
 
 	if (!f)
-
-
 	{
-
-
 		MessageBoxW(g_state->hMainWnd, L"Failed to open file for writing.", L"Save Log", MB_OK | MB_ICONERROR);
-
-
 		return;
-
-
 	}
 
-
 	// Write UTF-16LE with BOM so Notepad opens it reliably.
-
-
 	const unsigned char bom[2] = { 0xFF, 0xFE };
-
-
 	f.write((const char*)bom, 2);
-
-
 	f.write((const char*)textW.data(), (std::streamsize)textW.size() * (std::streamsize)sizeof(wchar_t));
-
-
 }
 static HFONT CreatePointFont(HWND hwndRef, int pointSize, const wchar_t* faceName, bool bold = false)
 {
@@ -953,23 +1012,90 @@ static fs::path MakeDestPath(const fs::path& installRoot, std::string_view manif
 // --------------------------------------------------
 struct ManifestEntry
 {
-	std::string remotePath;
-	std::string relPath;
-	std::string sha256;
+	std::string remotePath;  // normalized remote path (generic, '/' separators, no leading '/')
+	std::string relPath;     // normalized relative path under resources_override/mappack/
+	std::string sha256;      // expected SHA-256 (hex)
 };
-static bool ReadJsonStringValue(const std::string& s, size_t& i, std::string& out)
+
+// -----------------------------
+// Tiny JSON helpers (dependency-free)
+// Goal: Parse just {"files":[{"path":"...","sha256":"..."}, ...]} robustly.
+// - Does NOT assume key ordering
+// - Ignores unknown fields (any JSON value type)
+// - Supports \uXXXX escapes in strings
+// - Includes depth limits for pathological inputs
+// -----------------------------
+static void SkipWs(const std::string& s, size_t& i)
+{
+	while (i < s.size())
+	{
+		const char c = s[i];
+		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { ++i; continue; }
+		break;
+	}
+}
+
+static bool HexNibble(char c, uint32_t& out)
+{
+	if (c >= '0' && c <= '9') { out = uint32_t(c - '0'); return true; }
+	if (c >= 'a' && c <= 'f') { out = uint32_t(c - 'a' + 10); return true; }
+	if (c >= 'A' && c <= 'F') { out = uint32_t(c - 'A' + 10); return true; }
+	return false;
+}
+
+static bool ReadHex4(const std::string& s, size_t& i, uint32_t& outCodePoint)
+{
+	outCodePoint = 0;
+	for (int k = 0; k < 4; ++k)
+	{
+		if (i >= s.size()) return false;
+		uint32_t n = 0;
+		if (!HexNibble(s[i++], n)) return false;
+		outCodePoint = (outCodePoint << 4) | n;
+	}
+	return true;
+}
+
+static void AppendUtf8(uint32_t cp, std::string& out)
+{
+	// Minimal UTF-8 encoding
+	if (cp <= 0x7F)
+	{
+		out.push_back(char(cp));
+	}
+	else if (cp <= 0x7FF)
+	{
+		out.push_back(char(0xC0 | ((cp >> 6) & 0x1F)));
+		out.push_back(char(0x80 | (cp & 0x3F)));
+	}
+	else if (cp <= 0xFFFF)
+	{
+		out.push_back(char(0xE0 | ((cp >> 12) & 0x0F)));
+		out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+		out.push_back(char(0x80 | (cp & 0x3F)));
+	}
+	else
+	{
+		out.push_back(char(0xF0 | ((cp >> 18) & 0x07)));
+		out.push_back(char(0x80 | ((cp >> 12) & 0x3F)));
+		out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+		out.push_back(char(0x80 | (cp & 0x3F)));
+	}
+}
+
+static bool ReadJsonString(const std::string& s, size_t& i, std::string& out, std::string* outErr)
 {
 	out.clear();
-	if (i >= s.size() || s[i] != '"') return false;
+	if (i >= s.size() || s[i] != '"') { if (outErr) *outErr = "expected string"; return false; }
 	++i;
 	while (i < s.size())
 	{
-		char c = s[i++];
+		const char c = s[i++];
 		if (c == '"') return true;
 		if (c == '\\')
 		{
-			if (i >= s.size()) return false;
-			char e = s[i++];
+			if (i >= s.size()) { if (outErr) *outErr = "unterminated escape"; return false; }
+			const char e = s[i++];
 			switch (e)
 			{
 			case '"': out.push_back('"'); break;
@@ -979,104 +1105,392 @@ static bool ReadJsonStringValue(const std::string& s, size_t& i, std::string& ou
 			case 'f': out.push_back('\f'); break;
 			case 'n': out.push_back('\n'); break;
 			case 'r': out.push_back('\r'); break;
-			case 't': out.push_back('	'); break;
+			case 't': out.push_back('\t'); break;
 			case 'u':
-				return false;
+			{
+				uint32_t cp = 0;
+				if (!ReadHex4(s, i, cp)) { if (outErr) *outErr = "bad \\uXXXX escape"; return false; }
+				// Surrogate pair handling
+				if (cp >= 0xD800 && cp <= 0xDBFF)
+				{
+					// high surrogate; expect \uYYYY
+					if (i + 2 <= s.size() && s[i] == '\\' && s[i + 1] == 'u')
+					{
+						i += 2;
+						uint32_t low = 0;
+						if (!ReadHex4(s, i, low)) { if (outErr) *outErr = "bad low surrogate"; return false; }
+						if (low >= 0xDC00 && low <= 0xDFFF)
+						{
+							cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+						}
+						else
+						{
+							if (outErr) *outErr = "invalid surrogate pair";
+							return false;
+						}
+					}
+					else
+					{
+						if (outErr) *outErr = "missing low surrogate";
+						return false;
+					}
+				}
+				AppendUtf8(cp, out);
+				break;
+			}
 			default:
+				if (outErr) *outErr = "unsupported escape sequence";
 				return false;
 			}
 		}
 		else
 		{
+			// Control chars are not valid in JSON strings
+			if ((unsigned char)c < 0x20)
+			{
+				if (outErr) *outErr = "control character in string";
+				return false;
+			}
 			out.push_back(c);
 		}
 	}
+	if (outErr) *outErr = "unterminated string";
 	return false;
 }
-static void SkipWs(const std::string& s, size_t& i)
+
+static bool ReadJsonStringValue(const std::string& s, size_t& i, std::string& out)
 {
-	while (i < s.size())
-	{
-		char c = s[i];
-		if (c == ' ' || c == '	' || c == '\r' || c == '\n') { ++i; continue; }
-		break;
-	}
+	return ReadJsonString(s, i, out, nullptr);
 }
-static bool ParseManifestSha256(const std::string& jsonText, std::string& outBaseUrl, std::vector<ManifestEntry>& outFiles)
+
+static bool SkipJsonValue(const std::string& s, size_t& i, int depth, std::string* outErr);
+
+static bool SkipJsonNumber(const std::string& s, size_t& i)
 {
-	outBaseUrl.clear();
-	outFiles.clear();
-	const std::string& s = jsonText;
-	size_t i = 0;
-	size_t posBase = s.find("\"base_url\"");
-	if (posBase == std::string::npos) return false;
-	i = posBase + strlen("\"base_url\"");
-	SkipWs(s, i);
-	if (i >= s.size() || s[i] != ':') return false;
+	// JSON number: -? (0|[1-9][0-9]*) (.[0-9]+)? ([eE][+-]?[0-9]+)?
+	size_t start = i;
+	if (i < s.size() && (s[i] == '-')) ++i;
+	if (i >= s.size()) { i = start; return false; }
+	if (s[i] == '0') { ++i; }
+	else
+	{
+		if (s[i] < '1' || s[i] > '9') { i = start; return false; }
+		while (i < s.size() && (s[i] >= '0' && s[i] <= '9')) ++i;
+	}
+	if (i < s.size() && s[i] == '.')
+	{
+		++i;
+		if (i >= s.size() || s[i] < '0' || s[i] > '9') { i = start; return false; }
+		while (i < s.size() && (s[i] >= '0' && s[i] <= '9')) ++i;
+	}
+	if (i < s.size() && (s[i] == 'e' || s[i] == 'E'))
+	{
+		++i;
+		if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+		if (i >= s.size() || s[i] < '0' || s[i] > '9') { i = start; return false; }
+		while (i < s.size() && (s[i] >= '0' && s[i] <= '9')) ++i;
+	}
+	return i > start;
+}
+
+static bool SkipJsonArray(const std::string& s, size_t& i, int depth, std::string* outErr)
+{
+	if (i >= s.size() || s[i] != '[') { if (outErr) *outErr = "expected '['"; return false; }
 	++i;
 	SkipWs(s, i);
-	std::string base;
-	if (!ReadJsonStringValue(s, i, base)) return false;
-	outBaseUrl = base;
-	size_t posFiles = s.find("\"files\"");
-	if (posFiles == std::string::npos) return false;
-	i = posFiles + strlen("\"files\"");
-	SkipWs(s, i);
-	if (i >= s.size() || s[i] != ':') return false;
-	++i;
-	SkipWs(s, i);
-	if (i >= s.size() || s[i] != '[') return false;
-	++i;
-	while (i < s.size())
+	if (i < s.size() && s[i] == ']') { ++i; return true; }
+
+	for (;;)
 	{
 		SkipWs(s, i);
-		if (i >= s.size()) return false;
-		if (s[i] == ']') { ++i; break; }
+		if (!SkipJsonValue(s, i, depth + 1, outErr)) return false;
+		SkipWs(s, i);
+		if (i >= s.size()) { if (outErr) *outErr = "unterminated array"; return false; }
 		if (s[i] == ',') { ++i; continue; }
-		if (s[i] != '{') { return false; }
+		if (s[i] == ']') { ++i; return true; }
+		if (outErr) *outErr = "expected ',' or ']'";
+		return false;
+	}
+}
+
+static bool SkipJsonObject(const std::string& s, size_t& i, int depth, std::string* outErr)
+{
+	if (i >= s.size() || s[i] != '{') { if (outErr) *outErr = "expected '{'"; return false; }
+	++i;
+	SkipWs(s, i);
+	if (i < s.size() && s[i] == '}') { ++i; return true; }
+
+	for (;;)
+	{
+		SkipWs(s, i);
+		std::string key;
+		if (!ReadJsonString(s, i, key, outErr)) return false;
+		SkipWs(s, i);
+		if (i >= s.size() || s[i] != ':') { if (outErr) *outErr = "expected ':' after key"; return false; }
 		++i;
-		std::string path, digest;
-		while (i < s.size())
+		SkipWs(s, i);
+		if (!SkipJsonValue(s, i, depth + 1, outErr)) return false;
+		SkipWs(s, i);
+		if (i >= s.size()) { if (outErr) *outErr = "unterminated object"; return false; }
+		if (s[i] == ',') { ++i; continue; }
+		if (s[i] == '}') { ++i; return true; }
+		if (outErr) *outErr = "expected ',' or '}'";
+		return false;
+	}
+}
+
+static bool SkipJsonValue(const std::string& s, size_t& i, int depth, std::string* outErr)
+{
+	if (depth > 64) { if (outErr) *outErr = "JSON nesting too deep"; return false; }
+	if (i >= s.size()) { if (outErr) *outErr = "unexpected end of JSON"; return false; }
+
+	const char c = s[i];
+	if (c == '"')
+	{
+		std::string tmp;
+		return ReadJsonString(s, i, tmp, outErr);
+	}
+	if (c == '{') return SkipJsonObject(s, i, depth, outErr);
+	if (c == '[') return SkipJsonArray(s, i, depth, outErr);
+
+	// Literals
+	if (c == 't')
+	{
+		if (s.compare(i, 4, "true") == 0) { i += 4; return true; }
+		if (outErr) *outErr = "invalid literal";
+		return false;
+	}
+	if (c == 'f')
+	{
+		if (s.compare(i, 5, "false") == 0) { i += 5; return true; }
+		if (outErr) *outErr = "invalid literal";
+		return false;
+	}
+	if (c == 'n')
+	{
+		if (s.compare(i, 4, "null") == 0) { i += 4; return true; }
+		if (outErr) *outErr = "invalid literal";
+		return false;
+	}
+
+	// Number
+	if (c == '-' || (c >= '0' && c <= '9'))
+	{
+		if (SkipJsonNumber(s, i)) return true;
+		if (outErr) *outErr = "invalid number";
+		return false;
+	}
+
+	if (outErr) *outErr = "unexpected token";
+	return false;
+}
+
+static bool HasDotDotSegment(const std::string& rawPath)
+{
+	// Detect ".." segments before normalization so we can reject rather than silently clamp.
+	size_t i = 0;
+	while (i <= rawPath.size())
+	{
+		size_t j = rawPath.find_first_of("/\\", i);
+		if (j == std::string::npos) j = rawPath.size();
+		const std::string seg = rawPath.substr(i, j - i);
+		if (seg == "..") return true;
+		i = j + 1;
+	}
+	return false;
+}
+
+static bool IsSafeManifestPath(const std::string& rawPath, std::string* outErr)
+{
+	if (rawPath.empty()) { if (outErr) *outErr = "empty path"; return false; }
+
+	// Reject obvious absolute/UNC/drive paths
+	if (rawPath.size() >= 2 && std::isalpha((unsigned char)rawPath[0]) && rawPath[1] == ':')
+	{
+		if (outErr) *outErr = "absolute drive path not allowed";
+		return false;
+	}
+	if (rawPath.rfind("\\\\", 0) == 0 || rawPath.rfind("//", 0) == 0)
+	{
+		if (outErr) *outErr = "UNC path not allowed";
+		return false;
+	}
+
+	// Reject traversal segments
+	if (HasDotDotSegment(rawPath))
+	{
+		if (outErr) *outErr = "path traversal '..' not allowed";
+		return false;
+	}
+
+	// Basic control character check
+	for (unsigned char ch : rawPath)
+	{
+		if (ch < 0x20) { if (outErr) *outErr = "control character in path"; return false; }
+	}
+	return true;
+}
+
+static bool IsHex64(const std::string& s)
+{
+	if (s.size() != 64) return false;
+	for (char c : s)
+	{
+		if (!((c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F')))
+			return false;
+	}
+	return true;
+}
+
+// New manifest format: top-level JSON object with "files": [ { "path": "...", "sha256": "..." }, ... ]
+static bool ParseManifestSha256(const std::string& jsonText, std::vector<ManifestEntry>& outFiles, std::string* outErr)
+{
+	outFiles.clear();
+	if (outErr) outErr->clear();
+
+	// Size guard (network input)
+	static constexpr size_t kMaxManifestBytes = 50ull * 1024ull * 1024ull; // 50 MiB
+	if (jsonText.size() > kMaxManifestBytes)
+	{
+		if (outErr) *outErr = "manifest too large";
+		return false;
+	}
+
+	const std::string& s = jsonText;
+	size_t i = 0;
+	SkipWs(s, i);
+	if (i >= s.size() || s[i] != '{')
+	{
+		if (outErr) *outErr = "expected top-level object";
+		return false;
+	}
+	++i;
+
+	bool foundFiles = false;
+
+	for (;;)
+	{
+		SkipWs(s, i);
+		if (i >= s.size()) { if (outErr) *outErr = "unterminated top-level object"; return false; }
+		if (s[i] == '}') { ++i; break; }
+
+		std::string key;
+		if (!ReadJsonString(s, i, key, outErr)) return false;
+
+		SkipWs(s, i);
+		if (i >= s.size() || s[i] != ':') { if (outErr) *outErr = "expected ':' after key"; return false; }
+		++i;
+		SkipWs(s, i);
+
+		if (key == "files")
 		{
-			SkipWs(s, i);
-			if (i >= s.size()) return false;
-			if (s[i] == '}') { ++i; break; }
-			if (s[i] == ',') { ++i; continue; }
-			std::string key;
-			if (!ReadJsonStringValue(s, i, key)) return false;
-			SkipWs(s, i);
-			if (i >= s.size() || s[i] != ':') return false;
+			foundFiles = true;
+			if (i >= s.size() || s[i] != '[') { if (outErr) *outErr = "expected '[' for files"; return false; }
 			++i;
 			SkipWs(s, i);
-			std::string val;
-			if (!ReadJsonStringValue(s, i, val)) return false;
-			if (key == "path") path = val;
-			else if (key == "sha256" || key == "hash") digest = val;
+			if (i < s.size() && s[i] == ']') { ++i; } // empty array allowed
+			else
+			{
+				for (;;)
+				{
+					SkipWs(s, i);
+					if (i >= s.size()) { if (outErr) *outErr = "unterminated files array"; return false; }
+					if (s[i] != '{') { if (outErr) *outErr = "expected object in files array"; return false; }
+					++i;
+
+					std::string pathVal, hashVal;
+					for (;;)
+					{
+						SkipWs(s, i);
+						if (i >= s.size()) { if (outErr) *outErr = "unterminated file object"; return false; }
+						if (s[i] == '}') { ++i; break; }
+
+						std::string fkey;
+						if (!ReadJsonString(s, i, fkey, outErr)) return false;
+						SkipWs(s, i);
+						if (i >= s.size() || s[i] != ':') { if (outErr) *outErr = "expected ':' in file object"; return false; }
+						++i;
+						SkipWs(s, i);
+
+						if (fkey == "path")
+						{
+							if (!ReadJsonString(s, i, pathVal, outErr)) return false;
+						}
+						else if (fkey == "sha256" || fkey == "hash")
+						{
+							if (!ReadJsonString(s, i, hashVal, outErr)) return false;
+						}
+						else
+						{
+							// Skip any unknown field (string/number/object/array/bool/null)
+							if (!SkipJsonValue(s, i, 0, outErr)) return false;
+						}
+
+						SkipWs(s, i);
+						if (i >= s.size()) { if (outErr) *outErr = "unterminated file object"; return false; }
+						if (s[i] == ',') { ++i; continue; }
+						if (s[i] == '}') { ++i; break; }
+						if (outErr) *outErr = "expected ',' or '}' in file object";
+						return false;
+					}
+
+					if (!pathVal.empty() && !hashVal.empty())
+					{
+						std::string pathErr;
+						if (!IsSafeManifestPath(pathVal, &pathErr))
+						{
+							if (outErr) *outErr = "unsafe path: " + pathErr;
+							return false;
+						}
+						if (!IsHex64(hashVal))
+						{
+							if (outErr) *outErr = "invalid sha256 for path: " + pathVal;
+							return false;
+						}
+						ManifestEntry e;
+						e.remotePath = pathVal; // normalized later by caller
+						e.sha256 = hashVal;
+						outFiles.push_back(std::move(e));
+					}
+
+					SkipWs(s, i);
+					if (i >= s.size()) { if (outErr) *outErr = "unterminated files array"; return false; }
+					if (s[i] == ',') { ++i; continue; }
+					if (s[i] == ']') { ++i; break; }
+					if (outErr) *outErr = "expected ',' or ']' in files array";
+					return false;
+				}
+			}
 		}
-		if (!path.empty() && !digest.empty())
+		else
 		{
-			ManifestEntry e;
-			e.remotePath = path;
-			e.sha256 = digest;
-			outFiles.push_back(e);
+			// Skip unknown top-level fields
+			if (!SkipJsonValue(s, i, 0, outErr)) return false;
 		}
+
+		SkipWs(s, i);
+		if (i >= s.size()) { if (outErr) *outErr = "unterminated top-level object"; return false; }
+		if (s[i] == ',') { ++i; continue; }
+		if (s[i] == '}') { ++i; break; }
+		if (outErr) *outErr = "expected ',' or '}' in top-level object";
+		return false;
 	}
-	return !outBaseUrl.empty() && !outFiles.empty();
+
+	if (!foundFiles)
+	{
+		if (outErr) *outErr = "missing 'files' key";
+		return false;
+	}
+	// Empty files list is allowed but likely an error; keep it as failure to be safe.
+	if (outFiles.empty())
+	{
+		if (outErr) *outErr = "'files' array is empty";
+		return false;
+	}
+	return true;
 }
-// --------------------------------------------------
-// WinHTTP (no redirects; treat redirects as errors)
-// --------------------------------------------------
-namespace AppConstants
-{
-	static constexpr long kManifestConnectTimeoutSec = 15L;
-	static constexpr long kManifestTimeoutSec = 120L;
-	static constexpr long kFileConnectTimeoutMs = 15000L;
-	static constexpr long kFileTimeoutMs = 0L;
-	static constexpr const char* kUserAgent = "MapPackSyncTool by Cegaiel";
-	static constexpr const wchar_t* kUserAgentW = L"MapPackSyncTool by Cegaiel";
-}
-struct WinHttpHandleDeleter { void operator()(HINTERNET h) const noexcept { if (h) WinHttpCloseHandle(h); } };
-using WinHttpHandle = std::unique_ptr<void, WinHttpHandleDeleter>;
 
 static bool CrackUrlWinHttp(const std::string& urlUtf8, std::wstring& outHost, std::wstring& outPath, INTERNET_PORT& outPort, bool& outSecure, std::string* outErr)
 {
@@ -1117,6 +1531,9 @@ static bool CrackUrlWinHttp(const std::string& urlUtf8, std::wstring& outHost, s
 	return true;
 }
 
+// --------------------------------------------------
+// WinHTTP (no redirects; treat redirects as errors)
+// --------------------------------------------------
 static bool WinHttpGetToString_NoRedirects(
 	const std::string& urlUtf8,
 	std::string& outBody,
@@ -1836,17 +2253,18 @@ struct SyncCounters
 };
 struct ManifestData
 {
-	std::string baseUrl;
 	std::vector<ManifestEntry> workList;
 	std::unordered_set<std::string> manifestRelSet;
 };
-static std::string MakeFileUrlFromBase(const std::string& base, const std::string& remotePath)
+static std::string MakeFileUrlFromRemoteHost(const std::string& remotePath)
 {
-	std::string b = base;
-	if (!b.empty() && b.back() != '/') b.push_back('/');
+	// kRemoteHost has no trailing slash. remotePath in the manifest is expected to be relative,
+	// but we defensively handle a leading '/' as well.
+	std::string url = kRemoteHost;
+	if (!url.empty() && url.back() != '/') url.push_back('/');
 	if (!remotePath.empty() && remotePath.front() == '/')
-		return b + remotePath.substr(1);
-	return b + remotePath;
+		return url + remotePath.substr(1);
+	return url + remotePath;
 }
 // --------------------------------------------------
 // Manifest download + parsing
@@ -1869,10 +2287,11 @@ static bool DownloadAndParseManifest(const SyncConfig& cfg, ManifestData& out, s
 		return false;
 	}
 	std::vector<ManifestEntry> manifestFiles;
-	if (!ParseManifestSha256(manifestText, out.baseUrl, manifestFiles))
+	std::string parseErr;
+	if (!ParseManifestSha256(manifestText, manifestFiles, &parseErr))
 	{
 		PostProgressMarqueeOff();
-		outErr = "Manifest parse failed.";
+		outErr = "Manifest parse failed: " + (parseErr.empty() ? std::string("unknown error") : parseErr);
 		return false;
 	}
 	PostProgressMarqueeOff();
@@ -1984,7 +2403,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 				continue;
 			}
 		}
-		std::string fileUrl = MakeFileUrlFromBase(md.baseUrl, remotePath);
+		std::string fileUrl = MakeFileUrlFromRemoteHost(remotePath);
 		std::string dlErr2; long http2 = 0;
 		bool existed = fs::exists(localFile);
 		if (!DownloadUrlToFileVerifySha256(fileUrl, localFile, expectedHash, cancel, &dlErr2, &http2))
@@ -2187,6 +2606,11 @@ static unsigned __stdcall WorkerThreadProc(void*)
 		PostMessageW(g_state->hMainWnd, WM_APP_WORKER_DONE, 0, 0);
 		return 0;
 	}
+
+	// Persist last used folder even when user manually types it (INI created on first write).
+	if (!folderWs.empty())
+		IniWriteLastFolder(folderWs);
+
 	SyncConfig cfg;
 	cfg.remoteHost = kRemoteHost;
 	cfg.remoteRootPath = kRemoteRootPath;
@@ -2586,6 +3010,7 @@ struct UpdateResult
 	bool different = false;
 	std::wstring localVersion;
 	std::wstring remoteVersion;
+	std::string expectedSha256Lower; // from version.txt line 2
 	std::wstring err;
 	fs::path downloadedTemp;
 };
@@ -2653,6 +3078,146 @@ static bool LaunchUpdateHelperAndExitCurrent(const fs::path& downloadedExe)
 	return true;
 }
 
+
+// --------------------------------------------------
+// Update version.txt parsing + numeric version comparison
+// version.txt format:
+//   Line 1: numeric dotted version (e.g. 0.0.12)
+//   Line 2: sha256=<64-hex>  (or just 64-hex)
+// --------------------------------------------------
+static bool ExtractExpectedSha256Lower(const std::wstring& lineIn, std::string& outLower)
+{
+	outLower.clear();
+	std::wstring line = lineIn;
+	TrimInPlace(line);
+	if (line.empty()) return false;
+
+	// Optional "sha256=" prefix (case-insensitive)
+	const wchar_t* kPrefix = L"sha256=";
+	if (line.size() >= 7)
+	{
+		bool match = true;
+		for (size_t i = 0; i < 7; ++i)
+		{
+			wchar_t a = line[i];
+			wchar_t b = kPrefix[i];
+			if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+			if (a != b) { match = false; break; }
+		}
+		if (match)
+		{
+			line = line.substr(7);
+			TrimInPlace(line);
+		}
+	}
+
+	if (line.size() != 64) return false;
+
+	outLower.reserve(64);
+	for (wchar_t wc : line)
+	{
+		char c = (wc <= 0x7F) ? (char)wc : '\0';
+		bool ok = (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F');
+		if (!ok) { outLower.clear(); return false; }
+		if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+		outLower.push_back(c);
+	}
+	return true;
+}
+
+static bool ParseVersionTxt2Line(const std::wstring& txt, std::wstring& outVer, std::string& outShaLower, std::wstring& outErr)
+{
+	outVer.clear();
+	outShaLower.clear();
+	outErr.clear();
+
+	// Split on '\n' into at least 2 lines.
+	size_t p1 = txt.find(L'\n');
+	if (p1 == std::wstring::npos)
+	{
+		outErr = L"version.txt must have 2 lines: version then sha256.";
+		return false;
+	}
+	std::wstring line1 = txt.substr(0, p1);
+	size_t start2 = p1 + 1;
+	size_t p2 = txt.find(L'\n', start2);
+	std::wstring line2 = (p2 == std::wstring::npos) ? txt.substr(start2) : txt.substr(start2, p2 - start2);
+
+	TrimInPlace(line1);
+	TrimInPlace(line2);
+	if (!line1.empty() && line1.back() == L'\r') line1.pop_back();
+	if (!line2.empty() && line2.back() == L'\r') line2.pop_back();
+
+	if (line1.empty())
+	{
+		outErr = L"version.txt line 1 (version) is empty.";
+		return false;
+	}
+	if (!ExtractExpectedSha256Lower(line2, outShaLower))
+	{
+		outErr = L"version.txt line 2 must be sha256=<64-hex> (or just 64-hex).";
+		return false;
+	}
+
+	outVer = line1;
+	return true;
+}
+
+static bool ParseNumericDottedVersion(const std::wstring& sIn, std::vector<uint32_t>& outParts)
+{
+	outParts.clear();
+	std::wstring s = sIn;
+	TrimInPlace(s);
+	if (s.empty()) return false;
+
+	// Strict: only digits and '.'; no leading/trailing '.'; no consecutive '.'
+	if (s.front() == L'.' || s.back() == L'.') return false;
+
+	uint64_t cur = 0;
+	bool inPart = false;
+
+	for (size_t i = 0; i < s.size(); ++i)
+	{
+		wchar_t c = s[i];
+		if (c == L'.')
+		{
+			if (!inPart) return false; // consecutive dots or empty segment
+			if (cur > 0xFFFFFFFFull) return false;
+			outParts.push_back((uint32_t)cur);
+			cur = 0;
+			inPart = false;
+			continue;
+		}
+		if (c >= L'0' && c <= L'9')
+		{
+			inPart = true;
+			cur = cur * 10ull + (uint64_t)(c - L'0');
+			if (cur > 0xFFFFFFFFull) return false;
+			continue;
+		}
+		// Any other character is invalid (digits and dots only).
+		return false;
+	}
+	if (!inPart) return false;
+	outParts.push_back((uint32_t)cur);
+	return true;
+}
+
+static int CompareNumericVersions(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b)
+{
+	const size_t n = (a.size() > b.size()) ? a.size() : b.size();
+	for (size_t i = 0; i < n; ++i)
+	{
+		uint32_t av = (i < a.size()) ? a[i] : 0;
+		uint32_t bv = (i < b.size()) ? b[i] : 0;
+		if (av < bv) return -1;
+		if (av > bv) return 1;
+	}
+	return 0;
+}
+
 static unsigned __stdcall UpdateThreadProc(void* p)
 {
 	UpdateResult* res = (UpdateResult*)p;
@@ -2663,29 +3228,55 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	fs::path curExe = GetThisExePath();
 	if (curExe.empty()) { res->err = L"Cannot locate current exe"; return 0; }
 
-	// Update availability is decided by version.txt (NOT by hashing the remote exe).
+	// Update availability is decided by version.txt:
+	//   line 1: numeric dotted version (e.g. 0.0.12)
+	//   line 2: sha256=<64-hex> (or just 64-hex)
 	res->localVersion = MAP_PACK_SYNC_TOOL_VERSION;
 	TrimInPlace(res->localVersion);
+
+	std::wstring versionTxt;
 	std::wstring verErr;
-	if (!WinHttpDownloadUrlToWideString(kUpdateVersionUrl, res->remoteVersion, verErr))
+	if (!WinHttpDownloadUrlToWideString(kUpdateVersionUrl, versionTxt, verErr))
 	{
 		res->err = L"Failed to download version.txt: " + verErr;
 		return 0;
 	}
-	TrimInPlace(res->remoteVersion);
-	if (res->remoteVersion.empty())
+	TrimInPlace(versionTxt);
+	if (versionTxt.empty())
 	{
 		res->err = L"version.txt was empty";
 		return 0;
 	}
-	if (_wcsicmp(res->remoteVersion.c_str(), res->localVersion.c_str()) != 0)
-		res->different = true;
 
-	if (!res->different)
+	std::wstring parseErr;
+	if (!ParseVersionTxt2Line(versionTxt, res->remoteVersion, res->expectedSha256Lower, parseErr))
 	{
+		res->err = L"Invalid version.txt: " + parseErr;
+		return 0;
+	}
+
+	// Strict numeric comparison (digits and dots only).
+	std::vector<uint32_t> localParts, remoteParts;
+	if (!ParseNumericDottedVersion(res->localVersion, localParts))
+	{
+		res->err = L"Local version is not numeric dotted: " + res->localVersion;
+		return 0;
+	}
+	if (!ParseNumericDottedVersion(res->remoteVersion, remoteParts))
+	{
+		res->err = L"Remote version is not numeric dotted: " + res->remoteVersion;
+		return 0;
+	}
+
+	const int cmp = CompareNumericVersions(remoteParts, localParts);
+	// Update only when remote > local.
+	if (cmp <= 0)
+	{
+		res->different = false;
 		res->ok = true;
 		return 0;
 	}
+	res->different = true;
 
 	// New version available: download the updated exe to a temp file in the SAME directory as the exe so any relaunch uses the same dependency neighborhood.
 	fs::path tempExe = curExe.parent_path() / L"MapPackSyncTool.exe.download";
@@ -2697,6 +3288,22 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 		res->err = L"Download failed: " + dlErr;
 		return 0;
 	}
+
+	// Verify downloaded update exe against expected sha256 from version.txt line 2.
+	std::string gotSha;
+	if (!Sha256FileHexLower(tempExe, gotSha))
+	{
+		(void)DeleteFileW(tempExe.c_str());
+		res->err = L"Failed to compute SHA-256 of downloaded update.";
+		return 0;
+	}
+	if (_stricmp(gotSha.c_str(), res->expectedSha256Lower.c_str()) != 0)
+	{
+		(void)DeleteFileW(tempExe.c_str());
+		res->err = std::wstring(L"Update SHA-256 mismatch; refusing to install.\r\n\r\nExpected SHA-256:\r\n") + std::wstring(res->expectedSha256Lower.begin(), res->expectedSha256Lower.end()) + std::wstring(L"\r\n\r\nCurrent SHA-256:\r\n") + std::wstring(gotSha.begin(), gotSha.end());
+		return 0;
+	}
+
 	res->ok = true;
 	return 0;
 }
@@ -2862,7 +3469,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		{
 			std::wstring path;
 			if (BrowseForFolder(hwnd, path))
+			{
 				SetWindowTextW(st->hFolderEdit, path.c_str());
+				// Persist selection for next launch (INI created on first write).
+				if (!path.empty())
+					IniWriteLastFolder(path);
+			}
 		}
 		else if ((HWND)lParam == st->hRunButton)
 		{
@@ -2943,12 +3555,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		if (!res->different)
 		{
-			std::wstring msg = L"You are already running the latest version.\r\n\r\nLocal: " + res->localVersion + L"\r\nRemote: " + res->remoteVersion;
+			std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
 			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
 		}
-		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: " + res->localVersion + L"\r\nAvailable version: " + res->remoteVersion + L"\r\n\r\nProceed with the update?";
+		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick OK to proceed with the update.";
 		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for Updates...", MB_OKCANCEL | MB_ICONINFORMATION);
 		if (r != IDOK)
 		{
@@ -3064,10 +3676,19 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		190, 12, 410, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 
+	// Load last folder from portable INI (if present).
+	{
+		std::wstring last = IniReadLastFolder();
+		if (!last.empty())
+			SetWindowTextW(g_state->hFolderEdit, last.c_str());
+	}
+
 	// ===== DEBUG DEFAULT PATH =====
 	//#if defined(DEBUG_MESSAGE) && defined(_DEBUG)
 #if defined(DEBUG_MESSAGE)
-	SetWindowTextW(g_state->hFolderEdit, L"C:\\temp\\defs2");
+	// Debug preset only if INI didn't already supply a value.
+	if (GetWindowTextLengthW(g_state->hFolderEdit) == 0)
+		SetWindowTextW(g_state->hFolderEdit, L"C:\\temp\\defs2");
 #endif
 	// ==============================
 
