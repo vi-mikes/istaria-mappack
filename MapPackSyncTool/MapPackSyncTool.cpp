@@ -460,9 +460,55 @@ static bool OutputHasNonWhitespace()
 static void UpdateLogActionButtonsEnabled()
 {
 	if (!g_state) return;
+	if (g_state->isRunning.load())
+	{
+		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
+		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
+		return;
+	}
 	const BOOL enable = OutputHasNonWhitespace() ? TRUE : FALSE;
 	if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enable);
 	if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enable);
+}
+
+static void UpdateCheckUpdatesButtonEnabled()
+{
+	if (!g_state || !g_state->hCheckUpdatesBtn) return;
+	const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
+	EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+}
+
+
+// --------------------------------------------------
+// Unified UI toggle when a worker (sync/remove) is running.
+// Requirement: disable every button except Cancel Sync while running.
+// --------------------------------------------------
+static void SetUiForWorkerRunning(AppState* st, bool running)
+{
+	if (!st) return;
+
+	// Disable everything except Cancel while running.
+	if (st->hBrowseBtn) EnableWindow(st->hBrowseBtn, running ? FALSE : TRUE);
+	if (st->hRunButton) EnableWindow(st->hRunButton, running ? FALSE : TRUE);
+	if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, running ? FALSE : TRUE);
+	if (st->hFolderEdit) EnableWindow(st->hFolderEdit, running ? FALSE : TRUE);
+
+	// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
+	// We hard-disable them here when running; when idle we defer to the existing helper logic.
+	if (running)
+	{
+		if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, FALSE);
+		if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, FALSE);
+		if (st->hCheckUpdatesBtn) EnableWindow(st->hCheckUpdatesBtn, FALSE);
+	}
+	else
+	{
+		UpdateLogActionButtonsEnabled();
+		UpdateCheckUpdatesButtonEnabled();
+	}
+
+	// Cancel is the inverse (only enabled while running).
+	if (st->hCancelBtn) EnableWindow(st->hCancelBtn, running ? TRUE : FALSE);
 }
 
 static void AppendToOutputW(const wchar_t* text)
@@ -2636,18 +2682,14 @@ static void StartSyncIfNotRunning()
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
-	EnableWindow(g_state->hBrowseBtn, FALSE);
-	EnableWindow(g_state->hRunButton, FALSE);
-	if (g_state->hCancelBtn) EnableWindow(g_state->hCancelBtn, TRUE);
+	SetUiForWorkerRunning(g_state, true);
 	unsigned int tid = 0;
 	unique_handle worker(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &WorkerThreadProc, nullptr, 0, &tid)));
 	g_state->hWorkerThread = worker.release();
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		EnableWindow(g_state->hBrowseBtn, TRUE);
-		EnableWindow(g_state->hRunButton, TRUE);
-		if (g_state->hCancelBtn) EnableWindow(g_state->hCancelBtn, FALSE);
+		SetUiForWorkerRunning(g_state, false);
 		Log("ERROR: Failed to start worker thread.");
 	}
 }
@@ -2704,22 +2746,14 @@ static void StartRemoveIfNotRunning()
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
-
-	EnableWindow(g_state->hBrowseBtn, FALSE);
-	EnableWindow(g_state->hRunButton, FALSE);
-	if (g_state->hDeleteBtn) EnableWindow(g_state->hDeleteBtn, FALSE);
-	if (g_state->hCancelBtn) EnableWindow(g_state->hCancelBtn, TRUE);
-
+	SetUiForWorkerRunning(g_state, true);
 	unsigned int tid = 0;
 	unique_handle worker(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &WorkerThreadProcRemove, nullptr, 0, &tid)));
 	g_state->hWorkerThread = worker.release();
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		EnableWindow(g_state->hBrowseBtn, TRUE);
-		EnableWindow(g_state->hRunButton, TRUE);
-		if (g_state->hDeleteBtn) EnableWindow(g_state->hDeleteBtn, TRUE);
-		if (g_state->hCancelBtn) EnableWindow(g_state->hCancelBtn, FALSE);
+		SetUiForWorkerRunning(g_state, false);
 		Log("ERROR: Failed to start remove worker thread.");
 	}
 }
@@ -3313,14 +3347,14 @@ static void StartCheckForUpdates()
 	AppState* st = g_state;
 	if (!st) return;
 	if (st->isUpdateRunning.exchange(true)) return;
-	if (st->hCheckUpdatesBtn) EnableWindow(st->hCheckUpdatesBtn, FALSE);
+	UpdateCheckUpdatesButtonEnabled();
 
 	UpdateResult* res = new UpdateResult();
 	uintptr_t th = _beginthreadex(nullptr, 0, UpdateThreadProc, res, 0, nullptr);
 	if (!th)
 	{
 		st->isUpdateRunning.store(false);
-		if (st->hCheckUpdatesBtn) EnableWindow(st->hCheckUpdatesBtn, TRUE);
+		UpdateCheckUpdatesButtonEnabled();
 		delete res;
 		Log("ERROR: Failed to start update thread.\r\n");
 		return;
@@ -3359,10 +3393,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	{
 		if (st)
 		{
-			EnableWindow(st->hBrowseBtn, TRUE);
-			EnableWindow(st->hRunButton, TRUE);
-			if (st->hCancelBtn) EnableWindow(st->hCancelBtn, FALSE);
-			if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, TRUE);
+			SetUiForWorkerRunning(st, false);
 			if (st->hWorkerThread)
 			{
 				CloseHandle(st->hWorkerThread);
@@ -3543,7 +3574,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		if (st)
 		{
 			st->isUpdateRunning.store(false);
-			if (st->hCheckUpdatesBtn) EnableWindow(st->hCheckUpdatesBtn, TRUE);
+			UpdateCheckUpdatesButtonEnabled();
 			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
 		}
 		if (!res->ok)
