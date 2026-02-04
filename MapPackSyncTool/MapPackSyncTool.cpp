@@ -195,6 +195,7 @@ struct AppState
 	HWND hCopyLogBtn = nullptr;
 	HWND hSaveLogBtn = nullptr;
 	HWND hCheckUpdatesBtn = nullptr;
+	HWND hHelpBtn = nullptr;
 	HWND hFolderEdit = nullptr;
 	HWND hOutput = nullptr;
 	HWND hProgress = nullptr;
@@ -214,6 +215,7 @@ struct AppState
 	bool progressFrozenOnCancel = false;
 	HANDLE hUpdateThread = nullptr;
 	std::atomic_bool isUpdateRunning{ false };
+	bool logActionsArmed = false;
 };
 static AppState* g_state = nullptr;
 static HANDLE g_hSingleInstanceMutex = nullptr;
@@ -224,6 +226,7 @@ static std::wstring g_lastSaveDir;
 static fs::path GetThisExePath();
 static void TrimInPlace(std::wstring& s);
 static void StripSurroundingQuotes(std::wstring& s);
+static std::wstring Utf8ToWide(const std::string& s);
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -320,8 +323,10 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 
 	// Check-for-updates + Copy/Save buttons live on the progress-text row (right side)
 	const int updateW = 130;
+	const int helpW = 22;
 	int progTextY = progY + 18;
-	int saveLogX = right - btnW;
+	int helpX = right - helpW;
+	int saveLogX = helpX - gap - btnW;
 	int copyLogX = saveLogX - gap - btnW;
 	int updateX = copyLogX - gap - updateW;
 	int progTextW = updateX - gap - m;
@@ -334,7 +339,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	if (outW < 10) outW = 10;
 	if (outH < 10) outH = 10;
 	// Batch repositioning to reduce redraw/flicker
-	HDWP hdwp = BeginDeferWindowPos(12);
+	HDWP hdwp = BeginDeferWindowPos(13);
 	if (!hdwp) {
 		if (st->hFolderLabel) MoveWindow(st->hFolderLabel, labelX, labelY, labelW, 20, TRUE);
 		if (st->hFolderEdit)  MoveWindow(st->hFolderEdit, editX, editY, editW, ctrlH, TRUE);
@@ -347,6 +352,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 		if (st->hCheckUpdatesBtn) MoveWindow(st->hCheckUpdatesBtn, updateX, progTextY, updateW, btnH, TRUE);
 		if (st->hCopyLogBtn)   MoveWindow(st->hCopyLogBtn, copyLogX, progTextY, btnW, btnH, TRUE);
 		if (st->hSaveLogBtn)   MoveWindow(st->hSaveLogBtn, saveLogX, progTextY, btnW, btnH, TRUE);
+		if (st->hHelpBtn)         MoveWindow(st->hHelpBtn, helpX, progTextY, helpW, btnH, TRUE);
 		if (st->hOutput)       MoveWindow(st->hOutput, m, outY, outW, outH, TRUE);
 		return;
 	}
@@ -365,6 +371,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	defer(st->hCheckUpdatesBtn, updateX, progTextY, updateW, btnH);
 	defer(st->hCopyLogBtn, copyLogX, progTextY, btnW, btnH);
 	defer(st->hSaveLogBtn, saveLogX, progTextY, btnW, btnH);
+	defer(st->hHelpBtn, helpX, progTextY, helpW, btnH);
 	defer(st->hOutput, m, outY, outW, outH);
 	EndDeferWindowPos(hdwp);
 }
@@ -446,17 +453,6 @@ static std::wstring GetOutputTextW()
 	return buf;
 }
 
-static bool OutputHasNonWhitespace()
-{
-	const std::wstring t = GetOutputTextW();
-	for (wchar_t c : t)
-	{
-		if (!std::iswspace(c))
-			return true;
-	}
-	return false;
-}
-
 static void UpdateLogActionButtonsEnabled()
 {
 	if (!g_state) return;
@@ -466,9 +462,8 @@ static void UpdateLogActionButtonsEnabled()
 		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
 		return;
 	}
-	const BOOL enable = OutputHasNonWhitespace() ? TRUE : FALSE;
-	if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enable);
-	if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enable);
+	if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
+	if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
 }
 
 static void UpdateCheckUpdatesButtonEnabled()
@@ -476,6 +471,13 @@ static void UpdateCheckUpdatesButtonEnabled()
 	if (!g_state || !g_state->hCheckUpdatesBtn) return;
 	const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
 	EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+}
+
+static void UpdateHelpButtonEnabled()
+{
+	if (!g_state || !g_state->hHelpBtn) return;
+	const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
+	EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
 }
 
 
@@ -492,6 +494,7 @@ static void SetUiForWorkerRunning(AppState* st, bool running)
 	if (st->hRunButton) EnableWindow(st->hRunButton, running ? FALSE : TRUE);
 	if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, running ? FALSE : TRUE);
 	if (st->hFolderEdit) EnableWindow(st->hFolderEdit, running ? FALSE : TRUE);
+	if (st->hHelpBtn && running) EnableWindow(st->hHelpBtn, FALSE);
 
 	// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
 	// We hard-disable them here when running; when idle we defer to the existing helper logic.
@@ -505,6 +508,7 @@ static void SetUiForWorkerRunning(AppState* st, bool running)
 	{
 		UpdateLogActionButtonsEnabled();
 		UpdateCheckUpdatesButtonEnabled();
+		UpdateHelpButtonEnabled();
 	}
 
 	// Cancel is the inverse (only enabled while running).
@@ -526,6 +530,66 @@ static void ClearOutput()
 	if (g_state && g_state->hOutput)
 		SetWindowTextW(g_state->hOutput, L"");
 	UpdateLogActionButtonsEnabled();
+}
+
+// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
+// - If clearFirst is true, the output is cleared before loading.
+// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
+static bool LoadHelpTextIntoOutput(bool clearFirst, bool showErrorBox)
+{
+	if (!g_state || !g_state->hOutput)
+		return false;
+
+	if (clearFirst)
+		ClearOutput();
+
+	fs::path exePath = GetThisExePath();
+	fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
+
+	std::ifstream in(txtPath, std::ios::binary);
+	if (!in)
+	{
+		if (showErrorBox)
+		{
+			std::wstring msg = L"Could not open:\r\n\r\n" + txtPath.wstring();
+			MessageBoxW(g_state->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		}
+		return false;
+	}
+
+	std::string bytes;
+	in.seekg(0, std::ios::end);
+	std::streamoff sz = in.tellg();
+	if (sz < 0) sz = 0;
+	bytes.resize((size_t)sz);
+	in.seekg(0, std::ios::beg);
+	if (!bytes.empty())
+		in.read(bytes.data(), (std::streamsize)bytes.size());
+
+	std::wstring textW;
+	const unsigned char* b = (const unsigned char*)bytes.data();
+	const size_t n = bytes.size();
+	if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+	{
+		// UTF-16 LE BOM
+		const size_t wcharCount = (n - 2) / 2;
+		textW.assign((const wchar_t*)(b + 2), (const wchar_t*)(b + 2) + wcharCount);
+	}
+	else
+	{
+		size_t start = 0;
+		if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
+			start = 3; // UTF-8 BOM
+		textW = Utf8ToWide(bytes.substr(start));
+	}
+
+	SetWindowTextW(g_state->hOutput, textW.c_str());
+	// Scroll to top
+	SendMessageW(g_state->hOutput, EM_SETSEL, 0, 0);
+	SendMessageW(g_state->hOutput, EM_SCROLLCARET, 0, 0);
+	SendMessageW(g_state->hOutput, WM_VSCROLL, SB_TOP, 0);
+	UpdateLogActionButtonsEnabled();
+	return true;
 }
 
 static bool CopyOutputToClipboard()
@@ -820,7 +884,6 @@ struct PreflightResult
 	bool ok = false;
 	fs::path localBase;
 	fs::path localSyncRoot;
-	fs::path localDeleteRoot;
 	std::vector<std::string> errors;
 };
 struct SyncConfig
@@ -830,7 +893,6 @@ struct SyncConfig
 	std::string manifestUrl;
 	fs::path localBase;
 	fs::path localSyncRoot;
-	fs::path localDeleteRoot;
 };
 static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 {
@@ -883,7 +945,6 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 			return r;
 		}
 	}
-	r.localDeleteRoot = r.localSyncRoot / "resources" / "interface" / "maps";
 	r.ok = true;
 	return r;
 }
@@ -1970,7 +2031,7 @@ static std::string StripQueryAndFragment(std::string s)
 	if (cut != std::string::npos) s.resize(cut);
 	return s;
 }
-static int RemoveEmptyDirsBottomUp(const fs::path& root)
+static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false)
 {
 	std::error_code ec;
 	int removedDirs = 0;
@@ -2000,6 +2061,21 @@ static int RemoveEmptyDirsBottomUp(const fs::path& root)
 			else
 			{
 				ec.clear();
+			}
+		}
+		else
+		{
+			ec.clear();
+		}
+	}
+	if (removeRoot)
+	{
+		if (fs::is_directory(root, ec) && fs::is_empty(root, ec))
+		{
+			if (fs::remove(root, ec))
+			{
+				Log("  REMOVED EMPTY DIR: " + PathToUtf8(root) + "\r\n");
+				++removedDirs;
 			}
 		}
 		else
@@ -2197,6 +2273,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 	}
 
 	Log("Success!\r\n\r\n");
+	LogSeparator();
 
 	Log("Parsing and removing files from old MapPack 4.0...\r\n");
 	const fs::path oldRoot = cfg.localBase / "resources_override";
@@ -2364,24 +2441,22 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 	size_t filesDeleted = 0;
 
 	LogSeparator();
-	Log("Parsing local files: Searching for any local files (.def/.png) that exist but are not in the manifest; Those need deleted...\r\n");
+	Log("Clean-up MapPack 5.0: Searching local files that exist but are not in the manifest; Those need deleted...\r\n");
 	std::vector<fs::path> localFiles;
-	// Restrict deletions to: resources_override/mappack/resources/interface/maps/
-	if (fs::exists(cfg.localDeleteRoot))
+	// Scan entire sync root (resources_override/mappack/)
+	if (fs::exists(cfg.localSyncRoot))
 	{
-		for (auto& entry : fs::recursive_directory_iterator(cfg.localDeleteRoot))
+		for (auto& entry : fs::recursive_directory_iterator(cfg.localSyncRoot))
 		{
 			if (cancel.IsCanceled()) return;
 			if (!entry.is_regular_file()) continue;
-			std::string extLower = ToLowerAscii(entry.path().extension().string());
-			if (!IsSyncedExt(extLower)) continue;
 			localFiles.push_back(entry.path());
 		}
 	}
 	else
 	{
-		Log("NOTE: maps folder not found; nothing to delete.\r\n");
-		Log("Expected: " + PathToUtf8(cfg.localDeleteRoot) + "\r\n");
+		Log("NOTE: sync root folder not found; nothing to delete.\r\n");
+		Log("Expected: " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
 		return;
 	}
 	for (const auto& fullPath : localFiles)
@@ -2415,7 +2490,7 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md, SyncCounters& ioCounts, const CancelToken& cancel)
 {
 	if (cancel.IsCanceled()) return;
-	Log("Parsing manifest: Searching for any local files that are missing or has changed...\r\n");
+	Log("Parsing MapPack 5.0 manifest: Searching for any local files that are missing or has changed (Needs updated)...\r\n");
 	bool anyChanged = false;
 	PostProgressInit(md.workList.size());
 	for (size_t i = 0; i < md.workList.size(); ++i)
@@ -2501,7 +2576,7 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 	Log("  Manifest file count: " + std::to_string(md.workList.size()) + "\r\n");
 	if (CheckAndHandleCancel(cancel, "INFO: Canceled after manifest.\r\n"))
 		return;
-	Log("\r\nSyncing MapPack Root:  " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
+	Log("\r\nSyncing MapPack 5.0 root folder:  " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
 	SyncCounters counts;
 	LogSeparator();
 
@@ -2519,8 +2594,8 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 		return;
 
 	LogSeparator();
-	Log("Removing empty directories (maps folder only)...\r\n");
-	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localDeleteRoot);
+	Log("Clean-up/Remove MapPack 5.0 empty sub-directories...\r\n");
+	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
 
 	if (removedDirs == 0)
 		Log("  No empty sub-directories found; Nothing  to delete.\r\n");
@@ -2609,9 +2684,9 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 
 	if (IsCanceledNoNotify(cancel)) return;
 	LogSeparator();
-	Log("Removing empty sub-directories from MapPack 5.0 (resources_override/mappack)...\r\n");
+	Log("Removing empty sub-directories from MapPack 5.0 (sync root)...\r\n");
 
-	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localDeleteRoot);
+	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
 	if (removedDirs == 0)
 		Log("  No empty sub-directories found; Nothing  to delete.\r\n");
 	else
@@ -2663,7 +2738,6 @@ static unsigned __stdcall WorkerThreadProc(void*)
 	cfg.manifestUrl = JoinUrl(kRemoteHost, kManifestPath);
 	cfg.localBase = pf.localBase;
 	cfg.localSyncRoot = pf.localSyncRoot;
-	cfg.localDeleteRoot = pf.localDeleteRoot;
 	CancelToken cancel{ &g_state->cancelRequested };
 	RunSync(cfg, cancel);
 	g_state->isRunning.store(false);
@@ -2724,7 +2798,6 @@ static unsigned __stdcall WorkerThreadProcRemove(void*)
 	cfg.manifestUrl = JoinUrl(kRemoteHost, kManifestPath);
 	cfg.localBase = pf.localBase;
 	cfg.localSyncRoot = pf.localSyncRoot;
-	cfg.localDeleteRoot = pf.localDeleteRoot;
 
 	CancelToken cancel{ &g_state->cancelRequested };
 	RemoveMapPackFiles(cfg, cancel);
@@ -3509,6 +3582,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		else if ((HWND)lParam == st->hRunButton)
 		{
+			st->logActionsArmed = true;
+			UpdateHelpButtonEnabled();
 			ClearOutput();
 			if (IsProcessRunningByName(L"istaria.exe"))
 			{
@@ -3537,6 +3612,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		else if ((HWND)lParam == st->hDeleteBtn)
 		{
+			st->logActionsArmed = true;
+			UpdateHelpButtonEnabled();
 			ClearOutput();
 			if (IsProcessRunningByName(L"istaria.exe"))
 			{
@@ -3555,8 +3632,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		else if ((HWND)lParam == st->hCopyLogBtn)
 		{
-			if (CopyOutputToClipboard())
-				MessageBeep(MB_ICONASTERISK); // ding on successful copy
+			CopyOutputToClipboard();
 		}
 		else if ((HWND)lParam == st->hSaveLogBtn)
 		{
@@ -3565,6 +3641,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		else if ((HWND)lParam == st->hCheckUpdatesBtn)
 		{
 			StartCheckForUpdates();
+		}
+		else if ((HWND)lParam == st->hHelpBtn)
+		{
+			MessageBeep(MB_ICONASTERISK);
+			const int r = MessageBoxW(
+				hwnd,
+				L"Clear Log and Load Help?",
+				L"MapPack Sync Tool",
+				MB_OKCANCEL | MB_ICONQUESTION
+			);
+			if (r == IDOK)
+			{
+				st->logActionsArmed = false;
+				UpdateHelpButtonEnabled();
+				// Clear then load MapPackSyncTool.txt into the log.
+				LoadHelpTextIntoOutput(true, true);
+			}
 		}
 
 		break;
@@ -3734,7 +3827,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		690, 12, 60, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hCancelBtn = CreateWindowW(
-		L"BUTTON", L"Cancel Sync",
+		L"BUTTON", L"Cancel Action",
 		WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
 		755, 12, 60, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
@@ -3759,6 +3852,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 		0, 0, 130, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
+	g_state->hHelpBtn = CreateWindowW(
+		L"BUTTON", L"?",
+		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+		0, 0, 22, 22,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
 	// --------------------------------------------------
 	// PROGRESS BAR (FIXED: create WITHOUT PBS_MARQUEE)
 	// --------------------------------------------------
@@ -3782,6 +3880,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		MAIN_WINDOW_HEIGHT - OUTPUT_MARGIN_TOP - OUTPUT_MARGIN_BOTTOM,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	UpdateLogActionButtonsEnabled();
+	UpdateHelpButtonEnabled();
+	// On startup, load MapPackSyncTool.txt (if present) into the log.
+	LoadHelpTextIntoOutput(true, false);
 	// --------------------------------------------------
 	// Tooltips
 	// --------------------------------------------------
@@ -3804,14 +3905,15 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		// reduce hang-time a bit
 		SendMessageW(g_state->hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 4000);
 		SendMessageW(g_state->hTooltip, TTM_ACTIVATE, TRUE, 0);
-		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse for your Istaria base install folder (folder has istaria.exe)");
-		AddTooltip(g_state->hTooltip, g_state->hRunButton, L"Download/Update/Sync/Install MapPack");
+		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse for your Istaria base install folder");
+		AddTooltip(g_state->hTooltip, g_state->hRunButton, L"Download/Update/Sync/Install MapPack 5.0");
 		AddTooltip(g_state->hTooltip, g_state->hCancelBtn, L"Cancel Sync.");
 		AddTooltip(g_state->hTooltip, g_state->hDeleteBtn, L"Remove/Uninstall MapPack (New or Older versions)");
 		AddTooltip(g_state->hTooltip, g_state->hFolderEdit, L"Path to your Istaria base install folder");
-		AddTooltip(g_state->hTooltip, g_state->hCopyLogBtn, L"Copy the entire log to the clipboard");
-		AddTooltip(g_state->hTooltip, g_state->hSaveLogBtn, L"Save the entire log to a .txt file");
-		AddTooltip(g_state->hTooltip, g_state->hCheckUpdatesBtn, L"Check for updates");
+		AddTooltip(g_state->hTooltip, g_state->hCopyLogBtn, L"Copy Log to the clipboard");
+		AddTooltip(g_state->hTooltip, g_state->hSaveLogBtn, L"Save Log to a .txt file");
+		AddTooltip(g_state->hTooltip, g_state->hHelpBtn, L"Reload Help (Also displays upon startup)");
+		AddTooltip(g_state->hTooltip, g_state->hCheckUpdatesBtn, L"Check for updates of MapPack Sync Tool");
 	}
 	LayoutMainWindow(g_state->hMainWnd, g_state);
 	SendMessageW(g_state->hOutput, EM_EXLIMITTEXT, 0, (LPARAM)(8ULL * 1024ULL * 1024ULL));
