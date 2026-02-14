@@ -23,6 +23,8 @@ Notes
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winver.h>
+#pragma comment(lib, "Version.lib")
 #include <wincrypt.h>
 #include <softpub.h>
 #include <wintrust.h>
@@ -51,6 +53,39 @@ Notes
 #include <functional>  // std::function
 #include <memory>      // std::unique_ptr
 #include <winhttp.h>
+
+// ------------------------------------------------------------
+// Version helper: read FileVersion from VERSIONINFO resource
+// ------------------------------------------------------------
+#include <vector>
+
+static std::wstring GetExeFileVersionString()
+{
+	wchar_t path[MAX_PATH] = {};
+	if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
+		return L"unknown";
+
+	DWORD handle = 0;
+	DWORD size = GetFileVersionInfoSizeW(path, &handle);
+	if (size == 0)
+		return L"unknown";
+
+	std::vector<BYTE> buffer(size);
+	if (!GetFileVersionInfoW(path, handle, size, buffer.data()))
+		return L"unknown";
+
+	void* verData = nullptr;
+	UINT len = 0;
+
+	if (VerQueryValueW(buffer.data(),
+		L"\\StringFileInfo\\040904b0\\FileVersion",
+		&verData, &len) && len > 0)
+	{
+		return std::wstring(static_cast<wchar_t*>(verData));
+	}
+
+	return L"unknown";
+}
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -108,11 +143,9 @@ static inline bool SetErrFromStatus(std::wstring* outErrW, const Status& st) {
 // App identity (window title)
 // --------------------------------------------------
 #define MAP_PACK_SYNC_TOOL_NAME    L"MapPack Sync Tool"
-#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.1"
-
 static inline std::wstring GetDisplayVersion()
 {
-	return L"v" + std::wstring(MAP_PACK_SYNC_TOOL_VERSION);
+	return L"v" + std::wstring(GetExeFileVersionString().c_str());
 }
 
 static const std::wstring kWindowTitle =
@@ -3974,7 +4007,7 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	// Update availability is decided by version.txt:
 	//   line 1: numeric dotted version (e.g. 0.0.12)
 	//   line 2: sha256=<64-hex> (or just 64-hex)
-	res->localVersion = MAP_PACK_SYNC_TOOL_VERSION;
+	res->localVersion = GetExeFileVersionString().c_str();
 	TrimInPlace(res->localVersion);
 
 	std::wstring versionTxt;
