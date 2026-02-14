@@ -862,6 +862,81 @@ struct ScopeExit
 	std::function<void()> fn;
 	~ScopeExit() { if (fn) fn(); }
 };
+
+// --------------------------------------------------
+// RAII wrappers for common Win32/Crypto handle types
+// --------------------------------------------------
+
+struct BcryptAlgHandle
+{
+	BCRYPT_ALG_HANDLE h = nullptr;
+	BcryptAlgHandle() = default;
+	explicit BcryptAlgHandle(BCRYPT_ALG_HANDLE handle) : h(handle) {}
+	~BcryptAlgHandle() { if (h) { BCryptCloseAlgorithmProvider(h, 0); h = nullptr; } }
+	BcryptAlgHandle(const BcryptAlgHandle&) = delete;
+	BcryptAlgHandle& operator=(const BcryptAlgHandle&) = delete;
+	BcryptAlgHandle(BcryptAlgHandle&& o) noexcept : h(o.h) { o.h = nullptr; }
+	BcryptAlgHandle& operator=(BcryptAlgHandle&& o) noexcept { if (this != &o) { if (h) BCryptCloseAlgorithmProvider(h, 0); h = o.h; o.h = nullptr; } return *this; }
+	operator BCRYPT_ALG_HANDLE() const { return h; }
+	bool valid() const { return h != nullptr; }
+};
+
+struct BcryptHashHandle
+{
+	BCRYPT_HASH_HANDLE h = nullptr;
+	BcryptHashHandle() = default;
+	explicit BcryptHashHandle(BCRYPT_HASH_HANDLE handle) : h(handle) {}
+	~BcryptHashHandle() { if (h) { BCryptDestroyHash(h); h = nullptr; } }
+	BcryptHashHandle(const BcryptHashHandle&) = delete;
+	BcryptHashHandle& operator=(const BcryptHashHandle&) = delete;
+	BcryptHashHandle(BcryptHashHandle&& o) noexcept : h(o.h) { o.h = nullptr; }
+	BcryptHashHandle& operator=(BcryptHashHandle&& o) noexcept { if (this != &o) { if (h) BCryptDestroyHash(h); h = o.h; o.h = nullptr; } return *this; }
+	operator BCRYPT_HASH_HANDLE() const { return h; }
+	bool valid() const { return h != nullptr; }
+};
+
+struct CryptMsgHandle
+{
+	HCRYPTMSG h = nullptr;
+	CryptMsgHandle() = default;
+	explicit CryptMsgHandle(HCRYPTMSG handle) : h(handle) {}
+	~CryptMsgHandle() { if (h) { CryptMsgClose(h); h = nullptr; } }
+	CryptMsgHandle(const CryptMsgHandle&) = delete;
+	CryptMsgHandle& operator=(const CryptMsgHandle&) = delete;
+	CryptMsgHandle(CryptMsgHandle&& o) noexcept : h(o.h) { o.h = nullptr; }
+	CryptMsgHandle& operator=(CryptMsgHandle&& o) noexcept { if (this != &o) { if (h) CryptMsgClose(h); h = o.h; o.h = nullptr; } return *this; }
+	operator HCRYPTMSG() const { return h; }
+	bool valid() const { return h != nullptr; }
+};
+
+struct CertStoreHandle
+{
+	HCERTSTORE h = nullptr;
+	CertStoreHandle() = default;
+	explicit CertStoreHandle(HCERTSTORE handle) : h(handle) {}
+	~CertStoreHandle() { if (h) { CertCloseStore(h, 0); h = nullptr; } }
+	CertStoreHandle(const CertStoreHandle&) = delete;
+	CertStoreHandle& operator=(const CertStoreHandle&) = delete;
+	CertStoreHandle(CertStoreHandle&& o) noexcept : h(o.h) { o.h = nullptr; }
+	CertStoreHandle& operator=(CertStoreHandle&& o) noexcept { if (this != &o) { if (h) CertCloseStore(h, 0); h = o.h; o.h = nullptr; } return *this; }
+	operator HCERTSTORE() const { return h; }
+	bool valid() const { return h != nullptr; }
+};
+
+struct CertContextHandle
+{
+	PCCERT_CONTEXT p = nullptr;
+	CertContextHandle() = default;
+	explicit CertContextHandle(PCCERT_CONTEXT ctx) : p(ctx) {}
+	~CertContextHandle() { if (p) { CertFreeCertificateContext(p); p = nullptr; } }
+	CertContextHandle(const CertContextHandle&) = delete;
+	CertContextHandle& operator=(const CertContextHandle&) = delete;
+	CertContextHandle(CertContextHandle&& o) noexcept : p(o.p) { o.p = nullptr; }
+	CertContextHandle& operator=(CertContextHandle&& o) noexcept { if (this != &o) { if (p) CertFreeCertificateContext(p); p = o.p; o.p = nullptr; } return *this; }
+	operator PCCERT_CONTEXT() const { return p; }
+	bool valid() const { return p != nullptr; }
+};
+
 // --------------------------------------------------
 // String cleanup helpers (for edit box paths)
 // --------------------------------------------------
@@ -957,52 +1032,51 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 static bool Sha256FileHexLower(const fs::path& filePath, std::string& outHex)
 {
 	outHex.clear();
-	BCRYPT_ALG_HANDLE hAlg = nullptr;
-	BCRYPT_HASH_HANDLE hHash = nullptr;
-	NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+
+	BCRYPT_ALG_HANDLE rawAlg = nullptr;
+	BCRYPT_HASH_HANDLE rawHash = nullptr;
+
+	NTSTATUS st = BCryptOpenAlgorithmProvider(&rawAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
 	if (st != 0) return false;
+	BcryptAlgHandle hAlg(rawAlg);
+
 	DWORD objLen = 0, cbData = 0, hashLen = 0;
+
 	st = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbData, 0);
-	if (st != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
-	st = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cbData, 0);
-	if (st != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
-	std::vector<unsigned char> hashObj(objLen);
-	std::vector<unsigned char> hash(hashLen);
-	st = BCryptCreateHash(hAlg, &hHash, hashObj.data(), (ULONG)hashObj.size(), nullptr, 0, 0);
-	if (st != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
-	std::ifstream in(filePath, std::ios::binary);
-	if (!in)
-	{
-		BCryptDestroyHash(hHash);
-		BCryptCloseAlgorithmProvider(hAlg, 0);
-		return false;
-	}
-	std::vector<unsigned char> buf(1024 * 1024);
-	while (in)
-	{
-		in.read((char*)buf.data(), (std::streamsize)buf.size());
-		std::streamsize got = in.gcount();
-		if (got > 0)
-		{
-			st = BCryptHashData(hHash, buf.data(), (ULONG)got, 0);
-			if (st != 0)
-			{
-				BCryptDestroyHash(hHash);
-				BCryptCloseAlgorithmProvider(hAlg, 0);
-				return false;
-			}
-		}
-	}
-	st = BCryptFinishHash(hHash, hash.data(), (ULONG)hash.size(), 0);
-	BCryptDestroyHash(hHash);
-	BCryptCloseAlgorithmProvider(hAlg, 0);
 	if (st != 0) return false;
-	static const char* kHex = "0123456789abcdef";
+
+	st = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cbData, 0);
+	if (st != 0) return false;
+
+	std::vector<UCHAR> obj(objLen);
+	std::vector<UCHAR> hash(hashLen);
+
+	st = BCryptCreateHash(hAlg, &rawHash, obj.data(), (ULONG)obj.size(), nullptr, 0, 0);
+	if (st != 0) return false;
+	BcryptHashHandle hHash(rawHash);
+
+	std::ifstream f(filePath, std::ios::binary);
+	if (!f) return false;
+
+	std::vector<char> buf(64 * 1024);
+	while (f)
+	{
+		f.read(buf.data(), (std::streamsize)buf.size());
+		std::streamsize got = f.gcount();
+		if (got <= 0) break;
+		st = BCryptHashData(hHash, (PUCHAR)buf.data(), (ULONG)got, 0);
+		if (st != 0) return false;
+	}
+
+	st = BCryptFinishHash(hHash, hash.data(), (ULONG)hash.size(), 0);
+	if (st != 0) return false;
+
+	static const char* hexd = "0123456789abcdef";
 	outHex.resize(hash.size() * 2);
 	for (size_t i = 0; i < hash.size(); ++i)
 	{
-		outHex[i * 2 + 0] = kHex[(hash[i] >> 4) & 0xF];
-		outHex[i * 2 + 1] = kHex[(hash[i] >> 0) & 0xF];
+		outHex[i * 2 + 0] = hexd[(hash[i] >> 4) & 0xF];
+		outHex[i * 2 + 1] = hexd[hash[i] & 0xF];
 	}
 	return true;
 }
@@ -3408,10 +3482,12 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 	outThumbUpper.clear();
 	outErr.clear();
 
-	HCERTSTORE hStore = nullptr;
-	HCRYPTMSG hMsg = nullptr;
+	CertStoreHandle hStore;
+	CryptMsgHandle hMsg;
 
 	DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+	HCERTSTORE rawStore = nullptr;
+	HCRYPTMSG rawMsg = nullptr;
 	if (!CryptQueryObject(
 		CERT_QUERY_OBJECT_FILE,
 		filePath,
@@ -3421,24 +3497,21 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 		&dwEncoding,
 		&dwContentType,
 		&dwFormatType,
-		&hStore,
-		&hMsg,
+		&rawStore,
+		&rawMsg,
 		nullptr))
 	{
 		outErr = L"CryptQueryObject failed.";
 		return false;
 	}
 
-	auto cleanup = [&]()
-	{
-		if (hMsg) { CryptMsgClose(hMsg); hMsg = nullptr; }
-		if (hStore) { CertCloseStore(hStore, 0); hStore = nullptr; }
-	};
+	// Wrap handles for automatic cleanup
+	hStore = CertStoreHandle(rawStore);
+	hMsg = CryptMsgHandle(rawMsg);
 
 	DWORD cbSignerInfo = 0;
 	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSignerInfo) || cbSignerInfo == 0)
 	{
-		cleanup();
 		outErr = L"CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM) failed.";
 		return false;
 	}
@@ -3446,7 +3519,6 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 	std::vector<BYTE> signerInfoBuf(cbSignerInfo);
 	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, signerInfoBuf.data(), &cbSignerInfo))
 	{
-		cleanup();
 		outErr = L"CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM) read failed.";
 		return false;
 	}
@@ -3467,7 +3539,6 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 
 	if (!pCertContext)
 	{
-		cleanup();
 		outErr = L"CertFindCertificateInStore failed.";
 		return false;
 	}
@@ -3476,7 +3547,6 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 	if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, nullptr, &cbHash) || cbHash == 0)
 	{
 		CertFreeCertificateContext(pCertContext);
-		cleanup();
 		outErr = L"CertGetCertificateContextProperty(CERT_HASH_PROP_ID) failed.";
 		return false;
 	}
@@ -3485,7 +3555,6 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 	if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, hashBytes.data(), &cbHash))
 	{
 		CertFreeCertificateContext(pCertContext);
-		cleanup();
 		outErr = L"CertGetCertificateContextProperty(CERT_HASH_PROP_ID) read failed.";
 		return false;
 	}
@@ -3493,7 +3562,6 @@ static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstrin
 	outThumbUpper = BytesToHexUpper(hashBytes.data(), cbHash);
 
 	CertFreeCertificateContext(pCertContext);
-	cleanup();
 	return true;
 }
 
