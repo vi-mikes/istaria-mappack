@@ -11,8 +11,6 @@ High-level behavior
 Safety invariants
 1) Manifest MUST be downloaded and parsed successfully before any delete occurs.
 2) Downloads are verified against manifest SHA-256 before replacing local files.
-3) "Not-in-manifest" deletions + empty-dir cleanup are intentionally limited in scope (maps folder only).
-   Legacy cleanup based on mappack_manifest_old.json may remove listed legacy files.
 Notes
 - UI remains responsive: sync runs on a worker thread; UI updates use PostMessage.
 - This file is intentionally kept as a single translation unit for easy building.
@@ -25,6 +23,9 @@ Notes
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wincrypt.h>
+#include <softpub.h>
+#include <wintrust.h>
 #include <tlhelp32.h>
 #include <cwchar>
 #include <cwctype>
@@ -51,6 +52,8 @@ Notes
 #include <memory>      // std::unique_ptr
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Comdlg32.lib")
@@ -61,7 +64,7 @@ namespace fs = std::filesystem;
 // App identity (window title)
 // --------------------------------------------------
 #define MAP_PACK_SYNC_TOOL_NAME    L"MapPack Sync Tool"
-#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.1"
+#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.0"
 
 static inline std::wstring GetDisplayVersion()
 {
@@ -3325,6 +3328,209 @@ static int CompareNumericVersions(const std::vector<uint32_t>& a, const std::vec
 	return 0;
 }
 
+
+// ==========================================================
+// Update security (production): Authenticode + pinned signer
+// - Production mode: DEBUG_MESSAGE is commented out.
+// - Non-production mode: DEBUG_MESSAGE enabled -> legacy SHA-256 path.
+// ==========================================================
+#ifndef DEBUG_MESSAGE
+static const wchar_t* kAllowedSignerThumbprints[] =
+{
+	L"8788209B20FDFA15C95C40DCBFDC038B54CA11BB", // current signing cert
+	// Add future renewal thumbprints here:
+	// L"NEWTHUMBPRINTHERE",
+};
+static const size_t kAllowedSignerThumbprintsCount =
+sizeof(kAllowedSignerThumbprints) / sizeof(kAllowedSignerThumbprints[0]);
+
+static std::wstring BytesToHexUpper(const BYTE* data, DWORD cb)
+{
+	static const wchar_t* kHex = L"0123456789ABCDEF";
+	std::wstring out;
+	out.reserve((size_t)cb * 2);
+	for (DWORD i = 0; i < cb; ++i)
+	{
+		BYTE b = data[i];
+		out.push_back(kHex[(b >> 4) & 0xF]);
+		out.push_back(kHex[b & 0xF]);
+	}
+	return out;
+}
+
+static bool IsAllowedSignerThumbprint(const std::wstring& thumbUpper)
+{
+	for (size_t i = 0; i < kAllowedSignerThumbprintsCount; ++i)
+	{
+		if (_wcsicmp(thumbUpper.c_str(), kAllowedSignerThumbprints[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+static bool VerifyAuthenticodeSignatureOnlineRevocation(const wchar_t* filePath, std::wstring& outErr)
+{
+	outErr.clear();
+
+	WINTRUST_FILE_INFO fi = {};
+	fi.cbStruct = sizeof(fi);
+	fi.pcwszFilePath = filePath;
+
+	WINTRUST_DATA wtd = {};
+	wtd.cbStruct = sizeof(wtd);
+	wtd.dwUIChoice = WTD_UI_NONE;
+	wtd.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+	wtd.dwUnionChoice = WTD_CHOICE_FILE;
+	wtd.pFile = &fi;
+
+	// Production security: allow online retrieval for CRL/OCSP (do NOT set WTD_CACHE_ONLY_URL_RETRIEVAL).
+	// Also ask for safer policy and exclude root from revocation checks.
+	wtd.dwProvFlags = WTD_SAFER_FLAG | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_DISABLE_MD2_MD4;
+
+	wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+
+	GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+	LONG st = WinVerifyTrust(nullptr, &action, &wtd);
+
+	wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+	(void)WinVerifyTrust(nullptr, &action, &wtd);
+
+	if (st == ERROR_SUCCESS)
+		return true;
+
+	wchar_t buf[128] = {};
+	_snwprintf_s(buf, _TRUNCATE, L"WinVerifyTrust failed (0x%08lX).", (unsigned long)st);
+	outErr = buf;
+	return false;
+}
+
+static bool GetAllowedSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstring& outThumbUpper, std::wstring& outErr)
+{
+	outThumbUpper.clear();
+	outErr.clear();
+
+	HCERTSTORE hStore = nullptr;
+	HCRYPTMSG hMsg = nullptr;
+
+	DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+	if (!CryptQueryObject(
+		CERT_QUERY_OBJECT_FILE,
+		filePath,
+		CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+		CERT_QUERY_FORMAT_FLAG_BINARY,
+		0,
+		&dwEncoding,
+		&dwContentType,
+		&dwFormatType,
+		&hStore,
+		&hMsg,
+		nullptr))
+	{
+		outErr = L"CryptQueryObject failed.";
+		return false;
+	}
+
+	auto cleanup = [&]()
+	{
+		if (hMsg) { CryptMsgClose(hMsg); hMsg = nullptr; }
+		if (hStore) { CertCloseStore(hStore, 0); hStore = nullptr; }
+	};
+
+	DWORD signerCount = 0;
+	DWORD cbSignerCount = sizeof(signerCount);
+	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cbSignerCount) || signerCount == 0)
+	{
+		cleanup();
+		outErr = L"CryptMsgGetParam(CMSG_SIGNER_COUNT_PARAM) failed.";
+		return false;
+	}
+
+	for (DWORD idx = 0; idx < signerCount; ++idx)
+	{
+		DWORD cbSignerInfo = 0;
+		if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, idx, nullptr, &cbSignerInfo) || cbSignerInfo == 0)
+			continue;
+
+		std::vector<BYTE> signerInfoBuf(cbSignerInfo);
+		if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, idx, signerInfoBuf.data(), &cbSignerInfo))
+			continue;
+
+		const CMSG_SIGNER_INFO* pSignerInfo = reinterpret_cast<const CMSG_SIGNER_INFO*>(signerInfoBuf.data());
+
+		CERT_INFO certInfo = {};
+		certInfo.Issuer = pSignerInfo->Issuer;
+		certInfo.SerialNumber = pSignerInfo->SerialNumber;
+
+		PCCERT_CONTEXT pCertContext = CertFindCertificateInStore(
+			hStore,
+			X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+			0,
+			CERT_FIND_SUBJECT_CERT,
+			&certInfo,
+			nullptr);
+
+		if (!pCertContext)
+			continue;
+
+		DWORD cbHash = 0;
+		if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, nullptr, &cbHash) || cbHash == 0)
+		{
+			CertFreeCertificateContext(pCertContext);
+			continue;
+		}
+
+		std::vector<BYTE> hashBytes(cbHash);
+		if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, hashBytes.data(), &cbHash))
+		{
+			CertFreeCertificateContext(pCertContext);
+			continue;
+		}
+
+		std::wstring thumbUpper = BytesToHexUpper(hashBytes.data(), cbHash);
+		CertFreeCertificateContext(pCertContext);
+
+		if (IsAllowedSignerThumbprint(thumbUpper))
+		{
+			outThumbUpper = thumbUpper;
+			cleanup();
+			return true;
+		}
+	}
+
+	cleanup();
+	outErr = L"No allowed signer certificate found in signature.";
+	return false;
+}
+
+static bool VerifyDownloadedUpdateExe_Production(const wchar_t* filePath, std::wstring& outErr)
+{
+	outErr.clear();
+
+	std::wstring sigErr;
+	if (!VerifyAuthenticodeSignatureOnlineRevocation(filePath, sigErr))
+	{
+		outErr = L"Authenticode verification failed: " + sigErr;
+		return false;
+	}
+
+	std::wstring thumbUpper;
+	std::wstring thumbErr;
+	if (!GetAllowedSignerThumbprintSha1HexUpper(filePath, thumbUpper, thumbErr))
+	{
+		outErr = L"Could not find an allowed signer certificate thumbprint: " + thumbErr;
+		return false;
+	}
+
+	if (!IsAllowedSignerThumbprint(thumbUpper))
+	{
+		outErr = L"Signer certificate is not trusted.\r\n\r\nSigner thumbprint:\r\n" + thumbUpper;
+		return false;
+	}
+
+	return true;
+}
+#endif // !DEBUG_MESSAGE
+
 static unsigned __stdcall UpdateThreadProc(void* p)
 {
 	UpdateResult* res = (UpdateResult*)p;
@@ -3396,7 +3602,18 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 		return 0;
 	}
 
-	// Verify downloaded update exe against expected sha256 from version.txt line 2.
+	// Verify downloaded update exe.
+#ifndef DEBUG_MESSAGE
+	// Production: STRICT Authenticode + pinned signer thumbprint allow-list (no hash fallback).
+	std::wstring verifyErr;
+	if (!VerifyDownloadedUpdateExe_Production(tempExe.c_str(), verifyErr))
+	{
+		(void)DeleteFileW(tempExe.c_str());
+		res->err = L"Update rejected.\r\n\r\n" + verifyErr;
+		return 0;
+	}
+#else
+	// Non-production: legacy SHA-256 check (easy testing without a signature).
 	std::string gotSha;
 	if (!Sha256FileHexLower(tempExe, gotSha))
 	{
@@ -3407,9 +3624,14 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	if (_stricmp(gotSha.c_str(), res->expectedSha256Lower.c_str()) != 0)
 	{
 		(void)DeleteFileW(tempExe.c_str());
-		res->err = std::wstring(L"Update SHA-256 mismatch; refusing to install.\r\n\r\nExpected SHA-256:\r\n") + std::wstring(res->expectedSha256Lower.begin(), res->expectedSha256Lower.end()) + std::wstring(L"\r\n\r\nCurrent SHA-256:\r\n") + std::wstring(gotSha.begin(), gotSha.end());
+		res->err = std::wstring(L"Update SHA-256 mismatch; refusing to install.\r\n\r\nExpected SHA-256:\r\n") +
+			std::wstring(res->expectedSha256Lower.begin(), res->expectedSha256Lower.end()) +
+			std::wstring(L"\r\n\r\nCurrent SHA-256:\r\n") +
+			std::wstring(gotSha.begin(), gotSha.end());
 		return 0;
 	}
+#endif
+
 
 	res->ok = true;
 	return 0;
