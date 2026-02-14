@@ -433,6 +433,44 @@ static constexpr UINT WM_APP_PROGRESS_TEXT = WM_APP + 14; // lParam = wchar_t* (
 // Worker completion message (main thread only)
 static constexpr UINT WM_APP_WORKER_DONE = WM_APP + 20;
 
+
+// Unified UI event message (main thread only): lParam = UiEvent* (new), UI frees
+static constexpr UINT WM_APP_UI_EVENT = WM_APP + 2;
+
+enum class UiEventKind : int
+{
+	LogAppendW = 1,
+	ProgressMarqueeOn,
+	ProgressMarqueeOff,
+	ProgressInit,       // u1 = total
+	ProgressSet,        // u1 = pos
+	ProgressTextW,      // text = progress label
+	WorkerDone,
+	UpdateResultPtr     // ptr = UpdateResult*
+};
+
+struct UiEvent
+{
+	UiEventKind kind{};
+	size_t u1 = 0;
+	size_t u2 = 0;
+	void* ptr = nullptr;
+	std::wstring text;
+};
+
+static bool PostUiEvent(UiEvent* ev)
+{
+	if (!ev) return false;
+	if (!g_state || !g_state->hMainWnd)
+	{
+		delete ev;
+		return false;
+	}
+	if (PostMessageW(g_state->hMainWnd, WM_APP_UI_EVENT, 0, (LPARAM)ev))
+		return true;
+	delete ev;
+	return false;
+}
 // --------------------------------------------------
 // PROGRESS BAR (FIXED: dynamic marquee style toggle)
 // --------------------------------------------------
@@ -860,9 +898,14 @@ static bool PostHeapMessageW(UINT msg, wchar_t* payload)
 // Thread-safe log: posts to main thread
 static void Log(const std::string& textUtf8)
 {
+	// Thread-safe log: post a unified UI event carrying wide text.
 	wchar_t* w = DupWideForPostUtf8(textUtf8);
 	if (!w) return;
-	PostHeapMessageW(WM_APP_LOG, w);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::LogAppendW;
+	ev->text.assign(w);
+	HeapFree(GetProcessHeap(), 0, w);
+	PostUiEvent(ev);
 }
 static void LogSeparator(char ch = '_', size_t count = 150)
 {
@@ -876,25 +919,36 @@ static void LogSeparator(char ch = '_', size_t count = 150)
 }
 static void PostProgressTextW(const std::wstring& textWide)
 {
-	wchar_t* w = DupWideForPostW(textWide);
-	if (!w) return;
-	PostHeapMessageW(WM_APP_PROGRESS_TEXT, w);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::ProgressTextW;
+	ev->text = textWide;
+	PostUiEvent(ev);
 }
 static void PostProgressMarqueeOn()
 {
-	PostMessageW(g_state->hMainWnd, WM_APP_PROGRESS_MARQ_ON, 0, 0);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::ProgressMarqueeOn;
+	PostUiEvent(ev);
 }
 static void PostProgressMarqueeOff()
 {
-	PostMessageW(g_state->hMainWnd, WM_APP_PROGRESS_MARQ_OFF, 0, 0);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::ProgressMarqueeOff;
+	PostUiEvent(ev);
 }
 static void PostProgressInit(size_t total)
 {
-	PostMessageW(g_state->hMainWnd, WM_APP_PROGRESS_INIT, (WPARAM)total, 0);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::ProgressInit;
+	ev->u1 = total;
+	PostUiEvent(ev);
 }
 static void PostProgressSet(size_t pos)
 {
-	PostMessageW(g_state->hMainWnd, WM_APP_PROGRESS_SET, (WPARAM)pos, 0);
+	UiEvent* ev = new UiEvent();
+	ev->kind = UiEventKind::ProgressSet;
+	ev->u1 = pos;
+	PostUiEvent(ev);
 }
 static bool CheckAndHandleCancel(const CancelToken& cancel, const char* logLine)
 {
@@ -3114,7 +3168,7 @@ static unsigned __stdcall WorkerThreadProc(void*)
 		for (const auto& line : pf.errors)
 			Log(line);
 		g_state->isRunning.store(false);
-		PostMessageW(g_state->hMainWnd, WM_APP_WORKER_DONE, 0, 0);
+		{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::WorkerDone; PostUiEvent(ev); }
 		return 0;
 	}
 
@@ -3131,7 +3185,7 @@ static unsigned __stdcall WorkerThreadProc(void*)
 	CancelToken cancel{ &g_state->cancelRequested };
 	RunSync(cfg, cancel);
 	g_state->isRunning.store(false);
-	PostMessageW(g_state->hMainWnd, WM_APP_WORKER_DONE, 0, 0);
+	{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::WorkerDone; PostUiEvent(ev); }
 	return 0;
 }
 static void StartSyncIfNotRunning()
@@ -3178,7 +3232,7 @@ static unsigned __stdcall WorkerThreadProcRemove(void*)
 		for (const auto& line : pf.errors)
 			Log(line);
 		g_state->isRunning.store(false);
-		PostMessageW(g_state->hMainWnd, WM_APP_WORKER_DONE, 0, 0);
+		{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::WorkerDone; PostUiEvent(ev); }
 		return 0;
 	}
 
@@ -3193,7 +3247,7 @@ static unsigned __stdcall WorkerThreadProcRemove(void*)
 	RemoveMapPackFiles(cfg, cancel);
 
 	g_state->isRunning.store(false);
-	PostMessageW(g_state->hMainWnd, WM_APP_WORKER_DONE, 0, 0);
+	{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::WorkerDone; PostUiEvent(ev); }
 	return 0;
 }
 
@@ -4036,7 +4090,7 @@ static void StartCheckForUpdates()
 	uintptr_t waiter = _beginthreadex(nullptr, 0, [](void* param)->unsigned {
 		auto* pair = (std::pair<AppState*, UpdateResult*>*)param;
 		WaitForSingleObject(pair->first->hUpdateThread, INFINITE);
-		PostMessageW(pair->first->hMainWnd, WM_APP + 77, 0, (LPARAM)pair->second);
+		{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::UpdateResultPtr; ev->ptr = pair->second; PostMessageW(pair->first->hMainWnd, WM_APP_UI_EVENT, 0, (LPARAM)ev); }
 		delete pair;
 		return 0;
 		}, new std::pair<AppState*, UpdateResult*>(st, res), 0, nullptr);
@@ -4248,6 +4302,73 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	if (!st) st = g_state;
 	switch (msg)
 	{
+	case WM_APP_UI_EVENT:
+	{
+		std::unique_ptr<UiEvent> ev((UiEvent*)lParam);
+		if (!ev) return 0;
+		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+		if (!st2) st2 = g_state;
+		switch (ev->kind)
+		{
+		case UiEventKind::LogAppendW:
+			AppendToOutputW(ev->text.c_str());
+			break;
+		case UiEventKind::ProgressMarqueeOn:
+			if (st2)
+			{
+				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
+				SetProgressMarquee(st2, true);
+			}
+			break;
+		case UiEventKind::ProgressMarqueeOff:
+			if (st2)
+			{
+				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
+				SetProgressMarquee(st2, false);
+			}
+			break;
+		case UiEventKind::ProgressInit:
+			if (st2 && st2->hProgress)
+			{
+				int total = (int)ev->u1;
+				if (total <= 0) total = 1;
+				st2->progressTotal = total;
+				st2->progressPos = 0;
+				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
+				SetProgressMarquee(st2, false);
+				SendMessageW(st2->hProgress, PBM_SETRANGE32, 0, total);
+				SendMessageW(st2->hProgress, PBM_SETPOS, 0, 0);
+			}
+			break;
+		case UiEventKind::ProgressSet:
+			if (st2 && st2->hProgress)
+			{
+				int pos = (int)ev->u1;
+				st2->progressPos = pos;
+				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
+				SetProgressMarquee(st2, false);
+				SendMessageW(st2->hProgress, PBM_SETPOS, (WPARAM)pos, 0);
+			}
+			break;
+		case UiEventKind::ProgressTextW:
+			if (st2 && st2->hProgressText) SetWindowTextW(st2->hProgressText, ev->text.c_str());
+			break;
+		case UiEventKind::WorkerDone:
+			if (st2)
+			{
+				SetUiForWorkerRunning(st2, false);
+				if (st2->hWorkerThread) { CloseHandle(st2->hWorkerThread); st2->hWorkerThread = nullptr; }
+				if (st2->pendingExitAfterWorker) { DestroyWindow(hwnd); }
+			}
+			break;
+		case UiEventKind::UpdateResultPtr:
+			// Transfer ownership of UpdateResult* to the existing handler via lParam.
+			return HandleWmAppUpdateResult(st2, hwnd, 0, (LPARAM)ev->ptr);
+		default:
+			break;
+		}
+		return 0;
+	}
 	case WM_APP_LOG:
 	{
 		unique_heap_wstr w((wchar_t*)lParam);
