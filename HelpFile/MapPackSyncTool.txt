@@ -1,0 +1,36 @@
+Welcome to MapPack Sync Tool by Cegaiel.
+
+MapPack 5.0 (newly implemented) uses \resources_override\mappack\resources folder.
+MapPack 4.0 (deprecated) uses resources_override\resources folder, which we've incorrectly used for many years.
+This new path is what differentiates 4.0 vs 5.0.
+
+The reason we are using \resources_override\mappack\resources now is so that it is more mod friendly.
+It will help to avoid confusion when you add mod files that previously shared folders that MapPack 4.0 used.
+
+Now we can be sure that any files that exist in the \resources_override\mappack files should only contain mappack files.
+Hence this folder can be safely deleted, in future, without potentially removing mod files that you might've added.
+
+After Add/Sync'ing: You can continue using \resources_override\resources folder for any existing mods and keep it separate from MapPack files which was previously intertwined. Syncing will remove any old mappack 4.0 folders/files (only if listed in manifest) and add new mappack 5.0 folders/files. There should be no issues, after syncing MapPack, for it to continue/start working.
+
+Explanation of buttons:
+
+Browse button:
+- Select the folder your Istaria game exists. The selected folder MUST contain istaria.exe (to verify you're in the correct path).
+- You can also manually type the path, in the text box (to the left of Browse button), too.
+- Once you click Add/Sync or Remove buttons then this path is remembered, each subsequent time the program is started, in future.
+
+Add/Sync button:
+- Install MapPack 5.0 if it does not exist (see next line).
+- Sync MapPack 5.0 files which includes adding or removing files that differs from the manifest.
+- Deletes any EMPTY directories in \resoures_override\mappack folder, after the sync.
+- This will also verify and set 'string mapPath = "resources_override/mappack/resources/interface/maps"' which is the new 5.0 path.
+
+Cancel Action button:
+- Self-explanatory. This will stop all processes during Add/Sync or Remove buttons. Button is only enabled while processes are running.
+
+Remove button:
+- Uninstall MapPack. This will remove BOTH MapPack 5.0 as well any older versions such as 4.0 listed in manifest.
+- This will also verify and set 'string mapPath = "resources/interface/maps"' which is the original/vanilla path.
+
+
+If you get any errors about deletions then run this file as Administrator (right click file, Run as Admin).

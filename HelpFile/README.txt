@@ -1,0 +1,1 @@
+This file should exist beside the MapPackSyncTool.exe program so that it loads when the program is launched (or you press the ? button to reload).
