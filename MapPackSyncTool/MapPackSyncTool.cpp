@@ -1718,18 +1718,25 @@ static bool CrackUrlWinHttp(const std::string& urlUtf8, std::wstring& outHost, s
 // --------------------------------------------------
 // WinHTTP (no redirects; treat redirects as errors)
 // --------------------------------------------------
-static bool WinHttpGetToString_NoRedirects(
+struct WinHttpGetCtx
+{
+	WinHttpHandle session;
+	WinHttpHandle connect;
+	WinHttpHandle request;
+};
+
+static bool WinHttpOpenGet_NoRedirects(
 	const std::string& urlUtf8,
-	std::string& outBody,
+	WinHttpGetCtx& out,
 	const CancelToken& cancel,
 	long connectTimeoutMs,
 	long totalTimeoutMs,
 	std::string* outErr,
 	long* outHttp)
 {
-	outBody.clear();
 	if (outErr) outErr->clear();
 	if (outHttp) *outHttp = 0;
+	out = WinHttpGetCtx{};
 
 	std::wstring host, path;
 	INTERNET_PORT port = 0;
@@ -1737,22 +1744,35 @@ static bool WinHttpGetToString_NoRedirects(
 	if (!CrackUrlWinHttp(urlUtf8, host, path, port, secure, outErr))
 		return false;
 
-	WinHttpHandle hSession(WinHttpOpen(Utf8ToWide(AppConstants::kUserAgent).c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-	if (!hSession)
+	out.session = WinHttpHandle(WinHttpOpen(
+		Utf8ToWide(AppConstants::kUserAgent).c_str(),
+		WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME,
+		WINHTTP_NO_PROXY_BYPASS,
+		0));
+	if (!out.session)
 	{
 		if (outErr) *outErr = "WinHttpOpen failed (" + std::to_string(GetLastError()) + ")";
 		return false;
 	}
-	WinHttpHandle hConnect(WinHttpConnect((HINTERNET)hSession.get(), host.c_str(), port, 0));
-	if (!hConnect)
+
+	out.connect = WinHttpHandle(WinHttpConnect((HINTERNET)out.session.get(), host.c_str(), port, 0));
+	if (!out.connect)
 	{
 		if (outErr) *outErr = "WinHttpConnect failed (" + std::to_string(GetLastError()) + ")";
 		return false;
 	}
 
 	DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-	WinHttpHandle hRequest(WinHttpOpenRequest((HINTERNET)hConnect.get(), L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-	if (!hRequest)
+	out.request = WinHttpHandle(WinHttpOpenRequest(
+		(HINTERNET)out.connect.get(),
+		L"GET",
+		path.c_str(),
+		nullptr,
+		WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES,
+		flags));
+	if (!out.request)
 	{
 		if (outErr) *outErr = "WinHttpOpenRequest failed (" + std::to_string(GetLastError()) + ")";
 		return false;
@@ -1760,22 +1780,23 @@ static bool WinHttpGetToString_NoRedirects(
 
 	// Treat redirects as errors.
 	DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-	(void)WinHttpSetOption((HINTERNET)hRequest.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+	(void)WinHttpSetOption((HINTERNET)out.request.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
 	// Timeouts: resolve, connect, send, receive.
-	int resolveMs = connectTimeoutMs;
-	int connectMs = connectTimeoutMs;
-	int sendMs = connectTimeoutMs;
-	int recvMs = (totalTimeoutMs <= 0) ? 0 : totalTimeoutMs;
-	(void)WinHttpSetTimeouts((HINTERNET)hRequest.get(), resolveMs, connectMs, sendMs, recvMs);
+	const int resolveMs = (int)connectTimeoutMs;
+	const int connectMs = (int)connectTimeoutMs;
+	const int sendMs = (int)connectTimeoutMs;
+	const int recvMs = (totalTimeoutMs <= 0) ? 0 : (int)totalTimeoutMs;
+	(void)WinHttpSetTimeouts((HINTERNET)out.request.get(), resolveMs, connectMs, sendMs, recvMs);
 
 	if (cancel.IsCanceled()) { if (outErr) *outErr = "Canceled"; return false; }
-	if (!WinHttpSendRequest((HINTERNET)hRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
+
+	if (!WinHttpSendRequest((HINTERNET)out.request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
 	{
 		if (outErr) *outErr = "WinHttpSendRequest failed (" + std::to_string(GetLastError()) + ")";
 		return false;
 	}
-	if (!WinHttpReceiveResponse((HINTERNET)hRequest.get(), nullptr))
+	if (!WinHttpReceiveResponse((HINTERNET)out.request.get(), nullptr))
 	{
 		if (outErr) *outErr = "WinHttpReceiveResponse failed (" + std::to_string(GetLastError()) + ")";
 		return false;
@@ -1783,7 +1804,13 @@ static bool WinHttpGetToString_NoRedirects(
 
 	DWORD status = 0;
 	DWORD statusSize = sizeof(status);
-	WinHttpQueryHeaders((HINTERNET)hRequest.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+	(void)WinHttpQueryHeaders((HINTERNET)out.request.get(),
+		WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+		WINHTTP_HEADER_NAME_BY_INDEX,
+		&status,
+		&statusSize,
+		WINHTTP_NO_HEADER_INDEX);
+
 	if (outHttp) *outHttp = (long)status;
 
 	if (status >= 300 && status < 400)
@@ -1797,29 +1824,73 @@ static bool WinHttpGetToString_NoRedirects(
 		return false;
 	}
 
+	return true;
+}
+
+static bool WinHttpReadAllToString(
+	HINTERNET hRequest,
+	std::string& outBody,
+	const CancelToken& cancel,
+	size_t maxBytes,
+	std::string* outErr)
+{
+	outBody.clear();
+	if (outErr) outErr->clear();
+
 	std::string body;
+	body.reserve(64 * 1024);
+
 	for (;;)
 	{
 		if (cancel.IsCanceled()) { if (outErr) *outErr = "Canceled"; return false; }
+
 		DWORD avail = 0;
-		if (!WinHttpQueryDataAvailable((HINTERNET)hRequest.get(), &avail))
+		if (!WinHttpQueryDataAvailable(hRequest, &avail))
 		{
 			if (outErr) *outErr = "WinHttpQueryDataAvailable failed (" + std::to_string(GetLastError()) + ")";
 			return false;
 		}
 		if (avail == 0) break;
+
+		// Enforce a hard cap for text downloads (manifest/version files).
+		if (maxBytes > 0 && body.size() + (size_t)avail > maxBytes)
+		{
+			if (outErr) *outErr = "HTTP response too large";
+			return false;
+		}
+
 		std::vector<char> buf(avail);
 		DWORD read = 0;
-		if (!WinHttpReadData((HINTERNET)hRequest.get(), buf.data(), avail, &read))
+		if (!WinHttpReadData(hRequest, buf.data(), avail, &read))
 		{
 			if (outErr) *outErr = "WinHttpReadData failed (" + std::to_string(GetLastError()) + ")";
 			return false;
 		}
 		if (read == 0) break;
+
 		body.append(buf.data(), buf.data() + read);
 	}
+
 	outBody.swap(body);
 	return true;
+}
+
+static bool WinHttpGetToString_NoRedirects(
+	const std::string& urlUtf8,
+	std::string& outBody,
+	const CancelToken& cancel,
+	long connectTimeoutMs,
+	long totalTimeoutMs,
+	std::string* outErr,
+	long* outHttp)
+{
+	WinHttpGetCtx ctx;
+	if (!WinHttpOpenGet_NoRedirects(urlUtf8, ctx, cancel, connectTimeoutMs, totalTimeoutMs, outErr, outHttp))
+		return false;
+
+	// Text downloads should be small (manifest/version). Cap defensively.
+	const size_t kMaxTextBytes = 4u * 1024u * 1024u; // 4 MB
+	return WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel, kMaxTextBytes, outErr);
 }
 
 static bool DownloadUrl(const std::string& url, std::string& out, const CancelToken& cancel, std::string* outErr = nullptr, long* outHttp = nullptr)
@@ -1897,95 +1968,37 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 	if (outErr) outErr->clear();
 	if (outHttp) *outHttp = 0;
 
-	std::wstring host, path;
-	INTERNET_PORT port = 0;
-	bool secure = false;
-	if (!CrackUrlWinHttp(urlUtf8, host, path, port, secure, outErr))
+	WinHttpGetCtx http;
+	if (!WinHttpOpenGet_NoRedirects(urlUtf8, http, cancel, connectTimeoutMs, totalTimeoutMs, outErr, outHttp))
 		return false;
-
-	WinHttpHandle hSession(WinHttpOpen(Utf8ToWide(AppConstants::kUserAgent).c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-	if (!hSession)
-	{
-		if (outErr) *outErr = "WinHttpOpen failed (" + std::to_string(GetLastError()) + ")";
-		return false;
-	}
-	WinHttpHandle hConnect(WinHttpConnect((HINTERNET)hSession.get(), host.c_str(), port, 0));
-	if (!hConnect)
-	{
-		if (outErr) *outErr = "WinHttpConnect failed (" + std::to_string(GetLastError()) + ")";
-		return false;
-	}
-
-	DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-	WinHttpHandle hRequest(WinHttpOpenRequest((HINTERNET)hConnect.get(), L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-	if (!hRequest)
-	{
-		if (outErr) *outErr = "WinHttpOpenRequest failed (" + std::to_string(GetLastError()) + ")";
-		return false;
-	}
-
-	// Treat redirects as errors.
-	DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-	(void)WinHttpSetOption((HINTERNET)hRequest.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
-
-	int resolveMs = connectTimeoutMs;
-	int connectMs = connectTimeoutMs;
-	int sendMs = connectTimeoutMs;
-	int recvMs = (totalTimeoutMs <= 0) ? 0 : totalTimeoutMs;
-	(void)WinHttpSetTimeouts((HINTERNET)hRequest.get(), resolveMs, connectMs, sendMs, recvMs);
-
-	if (cancel.IsCanceled()) { if (outErr) *outErr = "Canceled"; return false; }
-	if (!WinHttpSendRequest((HINTERNET)hRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
-	{
-		if (outErr) *outErr = "WinHttpSendRequest failed (" + std::to_string(GetLastError()) + ")";
-		return false;
-	}
-	if (!WinHttpReceiveResponse((HINTERNET)hRequest.get(), nullptr))
-	{
-		if (outErr) *outErr = "WinHttpReceiveResponse failed (" + std::to_string(GetLastError()) + ")";
-		return false;
-	}
-
-	DWORD status = 0;
-	DWORD statusSize = sizeof(status);
-	WinHttpQueryHeaders((HINTERNET)hRequest.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
-	if (outHttp) *outHttp = (long)status;
-
-	if (status >= 300 && status < 400)
-	{
-		if (outErr) *outErr = "HTTP redirect received; redirects are treated as errors";
-		return false;
-	}
-	if (status < 200 || status >= 300)
-	{
-		if (outErr) *outErr = "HTTP status " + std::to_string(status);
-		return false;
-	}
 
 	for (;;)
 	{
 		if (cancel.IsCanceled()) { if (outErr) *outErr = "Canceled"; return false; }
+
 		DWORD avail = 0;
-		if (!WinHttpQueryDataAvailable((HINTERNET)hRequest.get(), &avail))
+		if (!WinHttpQueryDataAvailable((HINTERNET)http.request.get(), &avail))
 		{
 			if (outErr) *outErr = "WinHttpQueryDataAvailable failed (" + std::to_string(GetLastError()) + ")";
 			return false;
 		}
 		if (avail == 0) break;
-		std::vector<unsigned char> buf(avail);
+
+		std::vector<char> buf(avail);
 		DWORD read = 0;
-		if (!WinHttpReadData((HINTERNET)hRequest.get(), buf.data(), avail, &read))
+		if (!WinHttpReadData((HINTERNET)http.request.get(), buf.data(), avail, &read))
 		{
 			if (outErr) *outErr = "WinHttpReadData failed (" + std::to_string(GetLastError()) + ")";
 			return false;
 		}
 		if (read == 0) break;
+
 		if (ctx.f)
 		{
-			const size_t wrote = fwrite(buf.data(), 1, read, ctx.f);
+			size_t wrote = fwrite(buf.data(), 1, read, ctx.f);
 			if (wrote != read)
 			{
-				if (outErr) *outErr = "Failed writing to temp file";
+				if (outErr) *outErr = "fwrite failed";
 				return false;
 			}
 		}
@@ -1999,6 +2012,7 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 			}
 		}
 	}
+
 	return true;
 }
 static bool MoveReplace(const fs::path& from, const fs::path& to)
