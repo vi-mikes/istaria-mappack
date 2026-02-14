@@ -61,6 +61,50 @@ Notes
 namespace fs = std::filesystem;
 
 // --------------------------------------------------
+// Status helper (standardized error propagation)
+// --------------------------------------------------
+struct Status {
+	bool ok = true;
+	DWORD win32 = 0;
+	HRESULT hr = S_OK;      // optional
+	std::wstring msg;       // human-readable
+
+	static Status Ok() { return Status{}; }
+
+	static Status FailMsg(std::wstring m) {
+		Status s; s.ok = false; s.msg = std::move(m); return s;
+	}
+	static Status FailWin32(std::wstring m, DWORD e) {
+		Status s; s.ok = false; s.win32 = e; s.msg = std::move(m); return s;
+	}
+	static Status FailLastErr(std::wstring m) {
+		return FailWin32(std::move(m), GetLastError());
+	}
+	static Status FailHr(std::wstring m, HRESULT h) {
+		Status s; s.ok = false; s.hr = h; s.msg = std::move(m); return s;
+	}
+};
+
+static inline std::wstring StatusToWString(const Status& st) {
+	if (st.ok) return L"";
+	std::wstring m = st.msg.empty() ? L"Error" : st.msg;
+	if (st.win32 != 0) {
+		m += L" (win32=" + std::to_wstring(st.win32) + L")";
+	}
+	else if (FAILED(st.hr)) {
+		m += L" (hr=" + std::to_wstring((long long)st.hr) + L")";
+	}
+	return m;
+}
+
+static inline bool SetErrFromStatus(std::wstring* outErrW, const Status& st) {
+	if (!outErrW) return st.ok;
+	*outErrW = StatusToWString(st);
+	return st.ok;
+}
+
+
+// --------------------------------------------------
 // App identity (window title)
 // --------------------------------------------------
 #define MAP_PACK_SYNC_TOOL_NAME    L"MapPack Sync Tool"
@@ -768,6 +812,15 @@ static std::string WideToUtf8(const std::wstring& ws)
 	WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), out.data(), needed, nullptr, nullptr);
 	return out;
 }
+
+static inline bool SetErrFromStatus(std::string* outErrU8, const Status& st) {
+	if (!outErrU8) return st.ok;
+	std::wstring w = StatusToWString(st);
+	*outErrU8 = w.empty() ? std::string() : WideToUtf8(w);
+	return st.ok;
+}
+
+
 static std::string PathToUtf8(const fs::path& p)
 {
 	return WideToUtf8(p.wstring());
@@ -1651,6 +1704,41 @@ static bool IsHex64(const std::string& s)
 }
 
 // New manifest format: top-level JSON object with "files": [ { "path": "...", "sha256": "..." }, ... ]
+
+// Forward declarations (needed for Status wrappers)
+struct ManifestRawEntry;
+struct ManifestEntry;
+static bool ParseManifestRaw(const std::string& jsonText, std::vector<ManifestRawEntry>& outFiles, std::string* outErr);
+
+// Validate+normalize has a 4-arg core version (tracks duplicates) and a convenience 3-arg overload.
+static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& rawFiles,
+	std::vector<ManifestEntry>& outWorkList,
+	std::unordered_set<std::string>& outManifestRelSet,
+	std::string* outErr);
+
+// Convenience overload used by Status wrapper and other call sites.
+static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& rawFiles,
+	std::vector<ManifestEntry>& outWorkList,
+	std::string* outErr);
+
+static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& rawFiles,
+	std::vector<ManifestEntry>& outWorkList,
+	std::string* outErr)
+{
+	std::unordered_set<std::string> dummySet;
+	return ValidateAndNormalizeManifest(rawFiles, outWorkList, dummySet, outErr);
+}
+static Status ParseManifestRaw_Status(const std::string& jsonText, std::vector<ManifestRawEntry>& outEntries)
+{
+	std::string err;
+	std::vector<ManifestRawEntry> tmp;
+	if (!ParseManifestRaw(jsonText, tmp, &err)) {
+		return Status::FailMsg(Utf8ToWide(err));
+	}
+	outEntries.swap(tmp);
+	return Status::Ok();
+}
+
 static bool ParseManifestRaw(const std::string& jsonText, std::vector<ManifestRawEntry>& outFiles, std::string* outErr)
 {
 	outFiles.clear();
@@ -1786,6 +1874,22 @@ static bool ParseManifestRaw(const std::string& jsonText, std::vector<ManifestRa
 		return false;
 	}
 	return true;
+}
+
+
+
+
+static Status ValidateAndNormalizeManifest_Status(
+	const std::vector<ManifestRawEntry>& rawEntries,
+	std::vector<ManifestEntry>& outEntries)
+{
+	std::string err;
+	std::vector<ManifestEntry> tmp;
+	if (!ValidateAndNormalizeManifest(rawEntries, tmp, &err)) {
+		return Status::FailMsg(Utf8ToWide(err));
+	}
+	outEntries.swap(tmp);
+	return Status::Ok();
 }
 
 static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& rawFiles,
@@ -2063,6 +2167,35 @@ static bool WinHttpGetToString_NoRedirects(
 	const size_t kMaxTextBytes = 4u * 1024u * 1024u; // 4 MB
 	return WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel, kMaxTextBytes, outErr);
 }
+
+
+static Status WinHttpGetToString_NoRedirects_Status(
+	const std::string& urlUtf8,
+	std::string& outBody,
+	const CancelToken& cancel,
+	long connectTimeoutMs,
+	long totalTimeoutMs,
+	long* outHttp)
+{
+	std::string err;
+	WinHttpGetCtx ctx;
+	long http = 0;
+	if (!WinHttpOpenGet_NoRedirects(urlUtf8, ctx, cancel, connectTimeoutMs, totalTimeoutMs, &err, &http)) {
+		if (outHttp) *outHttp = http;
+		return Status::FailMsg(Utf8ToWide(err));
+	}
+
+	// Text downloads should be small (manifest/version). Cap defensively.
+	const size_t kMaxTextBytes = 4u * 1024u * 1024u; // 4 MB
+	if (!WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel, kMaxTextBytes, &err)) {
+		if (outHttp) *outHttp = http;
+		return Status::FailMsg(Utf8ToWide(err));
+	}
+
+	if (outHttp) *outHttp = http;
+	return Status::Ok();
+}
+
 
 static bool DownloadUrl(const std::string& url, std::string& out, const CancelToken& cancel, std::string* outErr = nullptr, long* outHttp = nullptr)
 {
