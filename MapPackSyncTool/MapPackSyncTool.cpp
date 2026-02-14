@@ -16,6 +16,9 @@ Notes
 - This file is intentionally kept as a single translation unit for easy building.
 */
 
+// We will update version numbers in the .rc file. Version numbers are no longer hard-coded in this file.
+// This will allow HashVersionWriter.exe to access the version number and write to version.txt easily!
+
 //////////////////////////////////////////////////////
 // Comment this out to suppress some local testing messages and/or presets
 // #define DEBUG_MESSAGE
