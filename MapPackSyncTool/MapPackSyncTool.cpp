@@ -108,7 +108,7 @@ static inline bool SetErrFromStatus(std::wstring* outErrW, const Status& st) {
 // App identity (window title)
 // --------------------------------------------------
 #define MAP_PACK_SYNC_TOOL_NAME    L"MapPack Sync Tool"
-#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.0"
+#define MAP_PACK_SYNC_TOOL_VERSION L"0.0.1"
 
 static inline std::wstring GetDisplayVersion()
 {
