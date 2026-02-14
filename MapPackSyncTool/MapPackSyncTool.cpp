@@ -3368,7 +3368,7 @@ static bool IsAllowedSignerThumbprint(const std::wstring& thumbUpper)
 	return false;
 }
 
-static bool VerifyAuthenticodeSignatureOnlineRevocation(const wchar_t* filePath, std::wstring& outErr)
+static bool VerifyAuthenticodeSignatureCacheOnly(const wchar_t* filePath, std::wstring& outErr)
 {
 	outErr.clear();
 
@@ -3383,9 +3383,8 @@ static bool VerifyAuthenticodeSignatureOnlineRevocation(const wchar_t* filePath,
 	wtd.dwUnionChoice = WTD_CHOICE_FILE;
 	wtd.pFile = &fi;
 
-	// Production security: allow online retrieval for CRL/OCSP (do NOT set WTD_CACHE_ONLY_URL_RETRIEVAL).
-	// Also ask for safer policy and exclude root from revocation checks.
-	wtd.dwProvFlags = WTD_SAFER_FLAG | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_DISABLE_MD2_MD4;
+	// Cache-only URL retrieval (as requested). This avoids network fetches for CRL/OCSP.
+	wtd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
 
 	wtd.dwStateAction = WTD_STATEACTION_VERIFY;
 
@@ -3404,7 +3403,7 @@ static bool VerifyAuthenticodeSignatureOnlineRevocation(const wchar_t* filePath,
 	return false;
 }
 
-static bool GetAllowedSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstring& outThumbUpper, std::wstring& outErr)
+static bool GetSignerThumbprintSha1HexUpper(const wchar_t* filePath, std::wstring& outThumbUpper, std::wstring& outErr)
 {
 	outThumbUpper.clear();
 	outErr.clear();
@@ -3436,70 +3435,66 @@ static bool GetAllowedSignerThumbprintSha1HexUpper(const wchar_t* filePath, std:
 		if (hStore) { CertCloseStore(hStore, 0); hStore = nullptr; }
 	};
 
-	DWORD signerCount = 0;
-	DWORD cbSignerCount = sizeof(signerCount);
-	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_COUNT_PARAM, 0, &signerCount, &cbSignerCount) || signerCount == 0)
+	DWORD cbSignerInfo = 0;
+	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cbSignerInfo) || cbSignerInfo == 0)
 	{
 		cleanup();
-		outErr = L"CryptMsgGetParam(CMSG_SIGNER_COUNT_PARAM) failed.";
+		outErr = L"CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM) failed.";
 		return false;
 	}
 
-	for (DWORD idx = 0; idx < signerCount; ++idx)
+	std::vector<BYTE> signerInfoBuf(cbSignerInfo);
+	if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, signerInfoBuf.data(), &cbSignerInfo))
 	{
-		DWORD cbSignerInfo = 0;
-		if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, idx, nullptr, &cbSignerInfo) || cbSignerInfo == 0)
-			continue;
-
-		std::vector<BYTE> signerInfoBuf(cbSignerInfo);
-		if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, idx, signerInfoBuf.data(), &cbSignerInfo))
-			continue;
-
-		const CMSG_SIGNER_INFO* pSignerInfo = reinterpret_cast<const CMSG_SIGNER_INFO*>(signerInfoBuf.data());
-
-		CERT_INFO certInfo = {};
-		certInfo.Issuer = pSignerInfo->Issuer;
-		certInfo.SerialNumber = pSignerInfo->SerialNumber;
-
-		PCCERT_CONTEXT pCertContext = CertFindCertificateInStore(
-			hStore,
-			X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-			0,
-			CERT_FIND_SUBJECT_CERT,
-			&certInfo,
-			nullptr);
-
-		if (!pCertContext)
-			continue;
-
-		DWORD cbHash = 0;
-		if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, nullptr, &cbHash) || cbHash == 0)
-		{
-			CertFreeCertificateContext(pCertContext);
-			continue;
-		}
-
-		std::vector<BYTE> hashBytes(cbHash);
-		if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, hashBytes.data(), &cbHash))
-		{
-			CertFreeCertificateContext(pCertContext);
-			continue;
-		}
-
-		std::wstring thumbUpper = BytesToHexUpper(hashBytes.data(), cbHash);
-		CertFreeCertificateContext(pCertContext);
-
-		if (IsAllowedSignerThumbprint(thumbUpper))
-		{
-			outThumbUpper = thumbUpper;
-			cleanup();
-			return true;
-		}
+		cleanup();
+		outErr = L"CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM) read failed.";
+		return false;
 	}
 
+	const CMSG_SIGNER_INFO* pSignerInfo = reinterpret_cast<const CMSG_SIGNER_INFO*>(signerInfoBuf.data());
+
+	CERT_INFO certInfo = {};
+	certInfo.Issuer = pSignerInfo->Issuer;
+	certInfo.SerialNumber = pSignerInfo->SerialNumber;
+
+	PCCERT_CONTEXT pCertContext = CertFindCertificateInStore(
+		hStore,
+		X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+		0,
+		CERT_FIND_SUBJECT_CERT,
+		&certInfo,
+		nullptr);
+
+	if (!pCertContext)
+	{
+		cleanup();
+		outErr = L"CertFindCertificateInStore failed.";
+		return false;
+	}
+
+	DWORD cbHash = 0;
+	if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, nullptr, &cbHash) || cbHash == 0)
+	{
+		CertFreeCertificateContext(pCertContext);
+		cleanup();
+		outErr = L"CertGetCertificateContextProperty(CERT_HASH_PROP_ID) failed.";
+		return false;
+	}
+
+	std::vector<BYTE> hashBytes(cbHash);
+	if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, hashBytes.data(), &cbHash))
+	{
+		CertFreeCertificateContext(pCertContext);
+		cleanup();
+		outErr = L"CertGetCertificateContextProperty(CERT_HASH_PROP_ID) read failed.";
+		return false;
+	}
+
+	outThumbUpper = BytesToHexUpper(hashBytes.data(), cbHash);
+
+	CertFreeCertificateContext(pCertContext);
 	cleanup();
-	outErr = L"No allowed signer certificate found in signature.";
-	return false;
+	return true;
 }
 
 static bool VerifyDownloadedUpdateExe_Production(const wchar_t* filePath, std::wstring& outErr)
@@ -3507,7 +3502,7 @@ static bool VerifyDownloadedUpdateExe_Production(const wchar_t* filePath, std::w
 	outErr.clear();
 
 	std::wstring sigErr;
-	if (!VerifyAuthenticodeSignatureOnlineRevocation(filePath, sigErr))
+	if (!VerifyAuthenticodeSignatureCacheOnly(filePath, sigErr))
 	{
 		outErr = L"Authenticode verification failed: " + sigErr;
 		return false;
@@ -3515,9 +3510,9 @@ static bool VerifyDownloadedUpdateExe_Production(const wchar_t* filePath, std::w
 
 	std::wstring thumbUpper;
 	std::wstring thumbErr;
-	if (!GetAllowedSignerThumbprintSha1HexUpper(filePath, thumbUpper, thumbErr))
+	if (!GetSignerThumbprintSha1HexUpper(filePath, thumbUpper, thumbErr))
 	{
-		outErr = L"Could not find an allowed signer certificate thumbprint: " + thumbErr;
+		outErr = L"Could not read signer certificate thumbprint: " + thumbErr;
 		return false;
 	}
 
@@ -3669,6 +3664,203 @@ static void StartCheckForUpdates()
 // --------------------------------------------------
 // Window Proc
 // --------------------------------------------------
+
+
+// ---- WndProc message handlers (refactor for readability) ----
+static LRESULT HandleWmSize(HWND hwnd, WPARAM wParam, LPARAM lParam)
+{
+	(void)wParam; (void)lParam;
+	AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	if (st2 && st2->hOutput)
+		LayoutMainWindow(hwnd, st2);
+	return 0;
+}
+
+static LRESULT HandleWmGetMinMaxInfo(HWND hwnd, LPARAM lParam)
+{
+	MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+	DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+	DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+	RECT r{ 0, 0, MIN_CLIENT_W, MIN_CLIENT_H };
+	AdjustWindowRectEx(&r, style, FALSE, ex);
+	mmi->ptMinTrackSize.x = (r.right - r.left);
+	mmi->ptMinTrackSize.y = (r.bottom - r.top);
+	return 0;
+}
+
+static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
+{
+
+	if ((HWND)lParam == st->hBrowseBtn)
+	{
+		std::wstring path;
+		if (BrowseForFolder(hwnd, path))
+		{
+			SetWindowTextW(st->hFolderEdit, path.c_str());
+			// Persist selection for next launch (INI created on first write).
+			if (!path.empty())
+				IniWriteLastFolder(path);
+		}
+	}
+	else if ((HWND)lParam == st->hRunButton)
+	{
+		st->logActionsArmed = true;
+		UpdateHelpButtonEnabled();
+		ClearOutput();
+		if (IsProcessRunningByName(L"istaria.exe"))
+		{
+			MessageBoxW(
+				hwnd,
+				L"Istaria is currently running.\r\n\r\n"
+				L"Please close Istaria before running MapPack Sync Tool.\r\n"
+				L"This tool should only be used when Istaria is not running.",
+				L"MapPack Sync Tool",
+				MB_ICONERROR | MB_OK
+			);
+			Log("ERROR: Aborted - istaria.exe is running. Exit the game before attempting to sync.\r\n");
+			return 0;
+		}
+		StartSyncIfNotRunning();
+	}
+	else if ((HWND)lParam == st->hCancelBtn)
+	{
+		if (st && st->isRunning.load())
+		{
+			st->cancelRequested.store(true);
+			EnableWindow(st->hCancelBtn, FALSE);
+			PostProgressTextW(L"Cancel requested... finishing current transfer.");
+			Log("INFO: Cancel sync requested.\r\n");
+		}
+	}
+	else if ((HWND)lParam == st->hDeleteBtn)
+	{
+		st->logActionsArmed = true;
+		UpdateHelpButtonEnabled();
+		ClearOutput();
+		if (IsProcessRunningByName(L"istaria.exe"))
+		{
+			MessageBoxW(
+				hwnd,
+				L"Istaria is currently running.\r\n\r\n"
+				L"Please close Istaria before removing MapPack files.\r\n"
+				L"This tool should only be used when Istaria is not running.",
+				L"MapPack Sync Tool",
+				MB_ICONERROR | MB_OK
+			);
+			Log("ERROR: Aborted remove - istaria.exe is running. Exit the game before attempting to remove.\r\n");
+			return 0;
+		}
+		StartRemoveIfNotRunning();
+	}
+	else if ((HWND)lParam == st->hCopyLogBtn)
+	{
+		CopyOutputToClipboard();
+	}
+	else if ((HWND)lParam == st->hSaveLogBtn)
+	{
+		SaveOutputToFile();
+	}
+	else if ((HWND)lParam == st->hCheckUpdatesBtn)
+	{
+		StartCheckForUpdates();
+	}
+	else if ((HWND)lParam == st->hHelpBtn)
+	{
+		MessageBeep(MB_ICONASTERISK);
+		const int r = MessageBoxW(
+			hwnd,
+			L"Clear Log and Load Help?",
+			L"MapPack Sync Tool",
+			MB_OKCANCEL | MB_ICONQUESTION
+		);
+		if (r == IDOK)
+		{
+			st->logActionsArmed = false;
+			UpdateHelpButtonEnabled();
+			// Clear then load MapPackSyncTool.txt into the log.
+			LoadHelpTextIntoOutput(true, true);
+		}
+	}
+
+	return DefWindowProc(hwnd, WM_COMMAND, wParam, lParam);
+}
+
+static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
+{
+
+	{
+		std::unique_ptr<UpdateResult> res((UpdateResult*)lParam);
+		if (st)
+		{
+			st->isUpdateRunning.store(false);
+			UpdateCheckUpdatesButtonEnabled();
+			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
+		}
+		if (!res->ok)
+		{
+			std::wstring msg = L"Update check failed:\r\n\r\n" + res->err;
+			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
+			return 0;
+		}
+		if (!res->different)
+		{
+			std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
+			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
+			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
+			return 0;
+		}
+		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick OK to proceed with the update.";
+		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for Updates...", MB_OKCANCEL | MB_ICONINFORMATION);
+		if (r != IDOK)
+		{
+			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
+			return 0;
+		}
+		// Launch helper (same directory) and exit so the helper can replace the running exe.
+		if (!LaunchUpdateHelperAndExitCurrent(res->downloadedTemp))
+		{
+			MessageBoxW(hwnd, L"Failed to launch update helper.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
+		}
+		return 0;
+	}
+}
+
+static LRESULT HandleWmClose(AppState* st, HWND hwnd)
+{
+
+	{
+		if (st && st->isRunning.load())
+		{
+			st->cancelRequested.store(true);
+			st->pendingExitAfterWorker = true;
+			if (st->hCancelBtn) EnableWindow(st->hCancelBtn, FALSE);
+			FreezeProgressOnCancel(st);
+			if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, TRUE);
+			PostProgressTextW(L"Cancel requested... exiting when safe.");
+			Log("INFO: Window close requested during sync; canceling.\r\n");
+			return 0;
+		}
+		DestroyWindow(hwnd);
+		return 0;
+	}
+}
+
+static LRESULT HandleWmDestroy(AppState* st, HWND hwnd)
+{
+
+	if (st)
+	{
+		if (st->hTooltip) { DestroyWindow(st->hTooltip); st->hTooltip = nullptr; }
+		if (st->hFontUI) { DeleteObject(st->hFontUI); st->hFontUI = nullptr; }
+		if (st->hFontMono) { DeleteObject(st->hFontMono); st->hFontMono = nullptr; }
+	}
+	PostQuitMessage(0);
+
+	return DefWindowProc(hwnd, WM_DESTROY, 0, 0);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	AppState* st = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -3773,179 +3965,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 	case WM_SIZE:
-	{
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (st2 && st2->hOutput)
-			LayoutMainWindow(hwnd, st2);
-		return 0;
-	}
+		return HandleWmSize(hwnd, wParam, lParam);
 	case WM_GETMINMAXINFO:
-	{
-		MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-		DWORD style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
-		DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-		RECT r{ 0, 0, MIN_CLIENT_W, MIN_CLIENT_H };
-		AdjustWindowRectEx(&r, style, FALSE, ex);
-		mmi->ptMinTrackSize.x = (r.right - r.left);
-		mmi->ptMinTrackSize.y = (r.bottom - r.top);
-		return 0;
-	}
+		return HandleWmGetMinMaxInfo(hwnd, lParam);
 	case WM_COMMAND:
-		if ((HWND)lParam == st->hBrowseBtn)
-		{
-			std::wstring path;
-			if (BrowseForFolder(hwnd, path))
-			{
-				SetWindowTextW(st->hFolderEdit, path.c_str());
-				// Persist selection for next launch (INI created on first write).
-				if (!path.empty())
-					IniWriteLastFolder(path);
-			}
-		}
-		else if ((HWND)lParam == st->hRunButton)
-		{
-			st->logActionsArmed = true;
-			UpdateHelpButtonEnabled();
-			ClearOutput();
-			if (IsProcessRunningByName(L"istaria.exe"))
-			{
-				MessageBoxW(
-					hwnd,
-					L"Istaria is currently running.\r\n\r\n"
-					L"Please close Istaria before running MapPack Sync Tool.\r\n"
-					L"This tool should only be used when Istaria is not running.",
-					L"MapPack Sync Tool",
-					MB_ICONERROR | MB_OK
-				);
-				Log("ERROR: Aborted - istaria.exe is running. Exit the game before attempting to sync.\r\n");
-				return 0;
-			}
-			StartSyncIfNotRunning();
-		}
-		else if ((HWND)lParam == st->hCancelBtn)
-		{
-			if (st && st->isRunning.load())
-			{
-				st->cancelRequested.store(true);
-				EnableWindow(st->hCancelBtn, FALSE);
-				PostProgressTextW(L"Cancel requested... finishing current transfer.");
-				Log("INFO: Cancel sync requested.\r\n");
-			}
-		}
-		else if ((HWND)lParam == st->hDeleteBtn)
-		{
-			st->logActionsArmed = true;
-			UpdateHelpButtonEnabled();
-			ClearOutput();
-			if (IsProcessRunningByName(L"istaria.exe"))
-			{
-				MessageBoxW(
-					hwnd,
-					L"Istaria is currently running.\r\n\r\n"
-					L"Please close Istaria before removing MapPack files.\r\n"
-					L"This tool should only be used when Istaria is not running.",
-					L"MapPack Sync Tool",
-					MB_ICONERROR | MB_OK
-				);
-				Log("ERROR: Aborted remove - istaria.exe is running. Exit the game before attempting to remove.\r\n");
-				return 0;
-			}
-			StartRemoveIfNotRunning();
-		}
-		else if ((HWND)lParam == st->hCopyLogBtn)
-		{
-			CopyOutputToClipboard();
-		}
-		else if ((HWND)lParam == st->hSaveLogBtn)
-		{
-			SaveOutputToFile();
-		}
-		else if ((HWND)lParam == st->hCheckUpdatesBtn)
-		{
-			StartCheckForUpdates();
-		}
-		else if ((HWND)lParam == st->hHelpBtn)
-		{
-			MessageBeep(MB_ICONASTERISK);
-			const int r = MessageBoxW(
-				hwnd,
-				L"Clear Log and Load Help?",
-				L"MapPack Sync Tool",
-				MB_OKCANCEL | MB_ICONQUESTION
-			);
-			if (r == IDOK)
-			{
-				st->logActionsArmed = false;
-				UpdateHelpButtonEnabled();
-				// Clear then load MapPackSyncTool.txt into the log.
-				LoadHelpTextIntoOutput(true, true);
-			}
-		}
-
-		break;
+		return HandleWmCommand(st, hwnd, wParam, lParam);
 	case WM_APP + 77:
-	{
-		std::unique_ptr<UpdateResult> res((UpdateResult*)lParam);
-		if (st)
-		{
-			st->isUpdateRunning.store(false);
-			UpdateCheckUpdatesButtonEnabled();
-			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
-		}
-		if (!res->ok)
-		{
-			std::wstring msg = L"Update check failed:\r\n\r\n" + res->err;
-			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
-			return 0;
-		}
-		if (!res->different)
-		{
-			std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
-			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
-			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
-			return 0;
-		}
-		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick OK to proceed with the update.";
-		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for Updates...", MB_OKCANCEL | MB_ICONINFORMATION);
-		if (r != IDOK)
-		{
-			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
-			return 0;
-		}
-		// Launch helper (same directory) and exit so the helper can replace the running exe.
-		if (!LaunchUpdateHelperAndExitCurrent(res->downloadedTemp))
-		{
-			MessageBoxW(hwnd, L"Failed to launch update helper.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
-		}
-		return 0;
-	}
+		return HandleWmAppUpdateResult(st, hwnd, wParam, lParam);
 	case WM_CLOSE:
-	{
-		if (st && st->isRunning.load())
-		{
-			st->cancelRequested.store(true);
-			st->pendingExitAfterWorker = true;
-			if (st->hCancelBtn) EnableWindow(st->hCancelBtn, FALSE);
-			FreezeProgressOnCancel(st);
-			if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, TRUE);
-			PostProgressTextW(L"Cancel requested... exiting when safe.");
-			Log("INFO: Window close requested during sync; canceling.\r\n");
-			return 0;
-		}
-		DestroyWindow(hwnd);
-		return 0;
-	}
+		return HandleWmClose(st, hwnd);
 	case WM_DESTROY:
-		if (st)
-		{
-			if (st->hTooltip) { DestroyWindow(st->hTooltip); st->hTooltip = nullptr; }
-			if (st->hFontUI) { DeleteObject(st->hFontUI); st->hFontUI = nullptr; }
-			if (st->hFontMono) { DeleteObject(st->hFontMono); st->hFontMono = nullptr; }
-		}
-		PostQuitMessage(0);
-		break;
+		return HandleWmDestroy(st, hwnd);
 	}
 	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
