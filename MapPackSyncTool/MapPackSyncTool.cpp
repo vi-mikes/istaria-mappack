@@ -1186,10 +1186,125 @@ static std::string NormalizeManifestRel(std::string_view manifestRelPath)
 	return rel;
 }
 
-static fs::path MakeDestPath(const fs::path& installRoot, std::string_view manifestRelPath)
+// Strict variant: rejects attempts to escape above root and disallows absolute/UNC/drive-qualified paths.
+static bool NormalizeManifestRelStrict(std::string_view manifestRelPath, std::string& outRel, std::string* outErr)
 {
-	const std::string rel = NormalizeManifestRel(manifestRelPath);
-	return installRoot / "resources_override" / "mappack" / fs::path(rel);
+	outRel.clear();
+	if (outErr) outErr->clear();
+
+	// Basic absolute/UNC/drive checks on the raw string (before normalization).
+	// - Reject UNC like "\\" or "//"
+	// - Reject drive-qualified like "C:\..." or "C:/..."
+	// - Reject embedded NUL
+	for (char c : manifestRelPath)
+	{
+		if (c == '\0')
+		{
+			if (outErr) *outErr = "path contains NUL";
+			return false;
+		}
+	}
+	if (manifestRelPath.size() >= 2)
+	{
+		const char a = manifestRelPath[0];
+		const char b = manifestRelPath[1];
+		if ((a == '\\' && b == '\\') || (a == '/' && b == '/'))
+		{
+			if (outErr) *outErr = "UNC paths not allowed";
+			return false;
+		}
+	}
+	if (manifestRelPath.size() >= 2 && ((manifestRelPath[1] == ':') && ((manifestRelPath[0] >= 'A' && manifestRelPath[0] <= 'Z') || (manifestRelPath[0] >= 'a' && manifestRelPath[0] <= 'z'))))
+	{
+		if (outErr) *outErr = "drive-qualified paths not allowed";
+		return false;
+	}
+
+	// Normalize to generic '/' separators and resolve dot segments, but fail if ".." would escape above root.
+	std::string s;
+	s.reserve(manifestRelPath.size());
+	for (char c : manifestRelPath)
+		s.push_back(c == '\\' ? '/' : c);
+
+	// Strip leading '/' (treat as relative for our purposes); still reject UNC was handled above.
+	while (!s.empty() && s.front() == '/')
+		s.erase(s.begin());
+
+	std::vector<std::string> parts;
+	parts.reserve(16);
+
+	size_t i = 0;
+	while (i <= s.size())
+	{
+		const size_t j = s.find('/', i);
+		const size_t end = (j == std::string::npos) ? s.size() : j;
+		std::string seg = s.substr(i, end - i);
+
+		// Skip empty / "." segments
+		if (!seg.empty() && seg != ".")
+		{
+			if (seg == "..")
+			{
+				if (parts.empty())
+				{
+					if (outErr) *outErr = "path attempts to escape root";
+					return false;
+				}
+				parts.pop_back();
+			}
+			else
+			{
+				// Disallow ':' anywhere to avoid drive injection and ADS tricks.
+				if (seg.find(':') != std::string::npos)
+				{
+					if (outErr) *outErr = "path contains ':'";
+					return false;
+				}
+				parts.push_back(std::move(seg));
+			}
+		}
+
+		if (j == std::string::npos) break;
+		i = j + 1;
+	}
+
+	std::string rel;
+	for (size_t k = 0; k < parts.size(); ++k)
+	{
+		if (k) rel.push_back('/');
+		rel += parts[k];
+	}
+
+	// Remove known prefixes after normalization.
+	const std::string p1 = "resources_override/mappack/";
+	const std::string p2 = "resources_override/";
+	const std::string p3 = "mappack/";
+	if (StartsWith(rel, p1)) rel = rel.substr(p1.size());
+	else if (StartsWith(rel, p2)) rel = rel.substr(p2.size());
+	else if (StartsWith(rel, p3)) rel = rel.substr(p3.size());
+
+	// Final safety: reject empty and any remaining dot segments.
+	if (rel.empty())
+	{
+		if (outErr) *outErr = "path resolves to empty";
+		return false;
+	}
+	if (rel.find("..") != std::string::npos)
+	{
+		// This is conservative; Normalize above should have removed legit dots; remaining ".." indicates something odd.
+		if (outErr) *outErr = "path contains '..'";
+		return false;
+	}
+
+	outRel = std::move(rel);
+	return true;
+}
+
+
+static fs::path MakeDestPath(const fs::path& installRoot, std::string_view validatedRelPath)
+{
+	// validatedRelPath is produced by ValidateAndNormalizeManifest() and is guaranteed to be relative and safe.
+	return installRoot / "resources_override" / "mappack" / fs::path(std::string(validatedRelPath));
 }
 // --------------------------------------------------
 // Manifest parsing
@@ -1200,6 +1315,13 @@ struct ManifestEntry
 	std::string relPath;     // normalized relative path under resources_override/mappack/
 	std::string sha256;      // expected SHA-256 (hex)
 };
+
+struct ManifestRawEntry
+{
+	std::string path;   // path string exactly as in manifest (UTF-8)
+	std::string sha256; // sha256 exactly as in manifest (hex)
+};
+
 
 // -----------------------------
 // Tiny JSON helpers (dependency-free)
@@ -1529,7 +1651,7 @@ static bool IsHex64(const std::string& s)
 }
 
 // New manifest format: top-level JSON object with "files": [ { "path": "...", "sha256": "..." }, ... ]
-static bool ParseManifestSha256(const std::string& jsonText, std::vector<ManifestEntry>& outFiles, std::string* outErr)
+static bool ParseManifestRaw(const std::string& jsonText, std::vector<ManifestRawEntry>& outFiles, std::string* outErr)
 {
 	outFiles.clear();
 	if (outErr) outErr->clear();
@@ -1622,19 +1744,9 @@ static bool ParseManifestSha256(const std::string& jsonText, std::vector<Manifes
 
 					if (!pathVal.empty() && !hashVal.empty())
 					{
-						std::string pathErr;
-						if (!IsSafeManifestPath(pathVal, &pathErr))
-						{
-							if (outErr) *outErr = "unsafe path: " + pathErr;
-							return false;
-						}
-						if (!IsHex64(hashVal))
-						{
-							if (outErr) *outErr = "invalid sha256 for path: " + pathVal;
-							return false;
-						}
-						ManifestEntry e;
-						e.remotePath = pathVal; // normalized later by caller
+						// Validation is performed in ValidateAndNormalizeManifest().
+						ManifestRawEntry e;
+						e.path = pathVal; // normalized later by ValidateAndNormalizeManifest()
 						e.sha256 = hashVal;
 						outFiles.push_back(std::move(e));
 					}
@@ -1675,6 +1787,65 @@ static bool ParseManifestSha256(const std::string& jsonText, std::vector<Manifes
 	}
 	return true;
 }
+
+static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& rawFiles,
+	std::vector<ManifestEntry>& outWorkList,
+	std::unordered_set<std::string>& outManifestRelSet,
+	std::string* outErr)
+{
+	outWorkList.clear();
+	outManifestRelSet.clear();
+	if (outErr) outErr->clear();
+
+	if (rawFiles.empty())
+	{
+		if (outErr) *outErr = "'files' array is empty";
+		return false;
+	}
+
+	outWorkList.reserve(rawFiles.size());
+	outManifestRelSet.reserve(rawFiles.size() * 2);
+
+	for (const auto& rf : rawFiles)
+	{
+		if (rf.path.empty())
+		{
+			if (outErr) *outErr = "file entry has empty path";
+			return false;
+		}
+		if (!IsHex64(rf.sha256))
+		{
+			if (outErr) *outErr = "invalid sha256 for path: " + rf.path;
+			return false;
+		}
+
+		ManifestEntry e;
+		e.remotePath = NormalizePathGeneric(rf.path);
+
+		std::string relErr;
+		if (!NormalizeManifestRelStrict(e.remotePath, e.relPath, &relErr))
+		{
+			if (outErr) *outErr = "unsafe path: " + (relErr.empty() ? rf.path : relErr) + " (" + rf.path + ")";
+			return false;
+		}
+
+		e.sha256 = rf.sha256;
+
+		if (!outManifestRelSet.insert(e.relPath).second)
+		{
+			if (outErr) *outErr = "duplicate path in manifest: " + e.relPath;
+			return false;
+		}
+
+		outWorkList.push_back(std::move(e));
+	}
+
+	std::sort(outWorkList.begin(), outWorkList.end(),
+		[](const ManifestEntry& a, const ManifestEntry& b) { return a.relPath < b.relPath; });
+
+	return true;
+}
+
 
 static bool CrackUrlWinHttp(const std::string& urlUtf8, std::wstring& outHost, std::wstring& outPath, INTERNET_PORT& outPort, bool& outSecure, std::string* outErr)
 {
@@ -2500,27 +2671,22 @@ static bool DownloadAndParseManifest(const SyncConfig& cfg, ManifestData& out, s
 		outErr = "Manifest download failed (HTTP " + std::to_string(http) + "): " + dlErr;
 		return false;
 	}
-	std::vector<ManifestEntry> manifestFiles;
+	std::vector<ManifestRawEntry> rawFiles;
 	std::string parseErr;
-	if (!ParseManifestSha256(manifestText, manifestFiles, &parseErr))
+	if (!ParseManifestRaw(manifestText, rawFiles, &parseErr))
 	{
 		PostProgressMarqueeOff();
 		outErr = "Manifest parse failed: " + (parseErr.empty() ? std::string("unknown error") : parseErr);
 		return false;
 	}
 	PostProgressMarqueeOff();
-	out.manifestRelSet.reserve(manifestFiles.size() * 2);
-	out.workList = std::move(manifestFiles);
-	for (auto& e : out.workList)
+
+	std::string valErr;
+	if (!ValidateAndNormalizeManifest(rawFiles, out.workList, out.manifestRelSet, &valErr))
 	{
-		std::string remote = NormalizePathGeneric(e.remotePath);
-		std::string rel = NormalizeManifestRel(remote);
-		e.remotePath = remote;
-		e.relPath = rel;
-		if (!rel.empty()) out.manifestRelSet.insert(rel);
+		outErr = "Manifest validation failed: " + (valErr.empty() ? std::string("unknown error") : valErr);
+		return false;
 	}
-	std::sort(out.workList.begin(), out.workList.end(),
-		[](const ManifestEntry& a, const ManifestEntry& b) { return a.relPath < b.relPath; });
 	return true;
 }
 static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
