@@ -313,7 +313,7 @@ static std::wstring Utf8ToWide(const std::string& s);
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
-// - Remembers the last selected Istaria base folder.
+// - Remembers the last selected Istaria Root folder.
 // --------------------------------------------------
 static const wchar_t* kSettingsIniName = L"MapPackSyncTool.ini";
 static const wchar_t* kIniSectionSettings = L"Settings";
@@ -986,6 +986,26 @@ static void PostProgressSet(size_t pos)
 	ev->u1 = pos;
 	PostUiEvent(ev);
 }
+static std::wstring MakeProgressFileLabel(const wchar_t* verb, size_t index1, size_t total, const std::string& relUtf8, const std::string* remoteUtf8 = nullptr)
+{
+	// Build a progress label that reliably shows the filename.
+	// We put the filename FIRST (right after the X/Y counter) so it stays visible even when the control is narrow.
+	std::string best = relUtf8;
+	if (best.empty() && remoteUtf8) best = *remoteUtf8;
+
+	std::string name = best;
+	const size_t p = name.find_last_of("/\\");
+	if (p != std::string::npos) name = name.substr(p + 1);
+
+	std::wstring nameW = Utf8ToWide(name.empty() ? best : name);
+	if (nameW.empty()) nameW = L"(unknown)";
+
+	std::wstring msg = std::wstring(verb) + L" " + std::to_wstring(index1) + L"/" + std::to_wstring(total) + L": " + nameW;
+
+	// (Intentionally showing filename only; full/relative paths can be long and get clipped.)
+	return msg;
+}
+
 static bool CheckAndHandleCancel(const CancelToken& cancel, const char* logLine)
 {
 	if (!cancel.IsCanceled()) return false;
@@ -1121,7 +1141,7 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 	std::error_code ec;
 	if (folderWs.empty())
 	{
-		r.errors.push_back("ERROR: Istaria Base Game Folder not selected. You need to choose a valid Istaria game folder to sync.\r\n");
+		r.errors.push_back("ERROR: Istaria root game folder not selected. You need to choose a valid Istaria game folder to sync.\r\n");
 		return r;
 	}
 	if (!fs::exists(folderWs, ec) || !fs::is_directory(folderWs, ec))
@@ -2985,9 +3005,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 		ScopeExit progressGuard{ [i]() {
 			PostProgressSet(i + 1);
 		} };
-		PostProgressTextW(
-			L"File " + std::to_wstring(i + 1) + L"/" + std::to_wstring(md.workList.size()) +
-			L": " + Utf8ToWide(rel));
+		PostProgressTextW(MakeProgressFileLabel(L"File", i + 1, md.workList.size(), rel, &remotePath));
 		fs::path localFile = MakeDestPath(cfg.localBase, rel);
 		if (fs::exists(localFile))
 		{
@@ -3132,8 +3150,7 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 
 		const std::string& rel = md.workList[i].relPath;
 		ScopeExit progressGuard{ [i]() { PostProgressSet(i + 1); } };
-		PostProgressTextW(L"Removing " + std::to_wstring(i + 1) + L"/" + std::to_wstring(md.workList.size()) + L": " + Utf8ToWide(rel));
-
+		PostProgressTextW(MakeProgressFileLabel(L"Removing", i + 1, md.workList.size(), rel, nullptr));
 		fs::path localFile = MakeDestPath(cfg.localBase, rel);
 		std::error_code ec;
 		if (!fs::exists(localFile, ec) || ec)
@@ -4387,7 +4404,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			}
 			break;
 		case UiEventKind::ProgressTextW:
-			if (st2 && st2->hProgressText) SetWindowTextW(st2->hProgressText, ev->text.c_str());
+			if (st2 && st2->hProgressText)
+			{
+				SetWindowTextW(st2->hProgressText, ev->text.c_str());
+				InvalidateRect(st2->hProgressText, nullptr, TRUE);
+			}
 			break;
 		case UiEventKind::WorkerDone:
 			if (st2)
@@ -4582,7 +4603,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	SendMessageW(g_state->hMainWnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIconSm);
 	ShowWindow(g_state->hMainWnd, SW_SHOW);
 	UpdateWindow(g_state->hMainWnd);
-	g_state->hFolderLabel = CreateWindowW(L"STATIC", L"Istaria Base Game Folder:", WS_CHILD | WS_VISIBLE,
+	g_state->hFolderLabel = CreateWindowW(L"STATIC", L"Istaria Root Game Folder:", WS_CHILD | WS_VISIBLE,
 		10, 15, 170, 20, g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hFolderEdit = CreateWindowW(
 		L"EDIT", L"",
@@ -4695,11 +4716,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		// reduce hang-time a bit
 		SendMessageW(g_state->hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 4000);
 		SendMessageW(g_state->hTooltip, TTM_ACTIVATE, TRUE, 0);
-		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse for your Istaria base install folder");
+		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse your Istaria Root Game Folder");
 		AddTooltip(g_state->hTooltip, g_state->hRunButton, L"Download/Update/Sync/Install MapPack 5.0");
-		AddTooltip(g_state->hTooltip, g_state->hCancelBtn, L"Cancel Sync.");
-		AddTooltip(g_state->hTooltip, g_state->hDeleteBtn, L"Remove/Uninstall MapPack (New or Older versions)");
-		AddTooltip(g_state->hTooltip, g_state->hFolderEdit, L"Path to your Istaria base install folder");
+		AddTooltip(g_state->hTooltip, g_state->hCancelBtn, L"Cancel current action");
+		AddTooltip(g_state->hTooltip, g_state->hDeleteBtn, L"Remove/Uninstall MapPack 5.0 (or Older 4.0 versions)");
+		AddTooltip(g_state->hTooltip, g_state->hFolderEdit, L"Path to your Istaria root install folder");
 		AddTooltip(g_state->hTooltip, g_state->hCopyLogBtn, L"Copy Log to the clipboard");
 		AddTooltip(g_state->hTooltip, g_state->hSaveLogBtn, L"Save Log to a .txt file");
 		AddTooltip(g_state->hTooltip, g_state->hHelpBtn, L"Reload Help (Also displays upon startup)");
