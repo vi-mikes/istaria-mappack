@@ -48,6 +48,7 @@ Notes
 #include <ctime>
 #include <process.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_set>
 #include <atomic>
@@ -68,13 +69,13 @@ static std::wstring GetExeFileVersionString()
 	if (!GetModuleFileNameW(nullptr, path, MAX_PATH))
 		return L"unknown";
 
-	DWORD handle = 0;
-	DWORD size = GetFileVersionInfoSizeW(path, &handle);
+	DWORD ignored = 0;
+	DWORD size = GetFileVersionInfoSizeW(path, &ignored);
 	if (size == 0)
 		return L"unknown";
 
 	std::vector<BYTE> buffer(size);
-	if (!GetFileVersionInfoW(path, handle, size, buffer.data()))
+	if (!GetFileVersionInfoW(path, 0, size, buffer.data()))
 		return L"unknown";
 
 	void* verData = nullptr;
@@ -114,12 +115,6 @@ struct Status {
 	}
 	static Status FailWin32(std::wstring m, DWORD e) {
 		Status s; s.ok = false; s.win32 = e; s.msg = std::move(m); return s;
-	}
-	static Status FailLastErr(std::wstring m) {
-		return FailWin32(std::move(m), GetLastError());
-	}
-	static Status FailHr(std::wstring m, HRESULT h) {
-		Status s; s.ok = false; s.hr = h; s.msg = std::move(m); return s;
 	}
 };
 
@@ -287,6 +282,7 @@ struct AppState
 	HFONT hFontUI = nullptr;
 	HFONT hFontMono = nullptr;
 	HANDLE hWorkerThread = nullptr;
+	DWORD uiThreadId = 0;
 	std::atomic_bool isRunning{ false };
 	std::atomic_bool cancelRequested{ false };
 	bool pendingExitAfterWorker = false;
@@ -459,18 +455,11 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	EndDeferWindowPos(hdwp);
 }
 // Custom message for log appends (main thread only)
-static constexpr UINT WM_APP_LOG = WM_APP + 1;
-// Progress bar messages (main thread only)
-static constexpr UINT WM_APP_PROGRESS_MARQ_ON = WM_APP + 10;
-static constexpr UINT WM_APP_PROGRESS_MARQ_OFF = WM_APP + 11;
-static constexpr UINT WM_APP_PROGRESS_INIT = WM_APP + 12; // wParam = total files
-static constexpr UINT WM_APP_PROGRESS_SET = WM_APP + 13;  // wParam = current (0..total)
-static constexpr UINT WM_APP_PROGRESS_TEXT = WM_APP + 14; // lParam = wchar_t* (HeapAlloc), UI frees
-// Worker completion message (main thread only)
-static constexpr UINT WM_APP_WORKER_DONE = WM_APP + 20;
+/* Legacy WM_APP_* log/progress/worker_done messages removed.
+   UI updates are now routed exclusively through WM_APP_UI_EVENT + UiEvent. */
 
 
-// Unified UI event message (main thread only): lParam = UiEvent* (new), UI frees
+   // Unified UI event message (main thread only): lParam = UiEvent* (new), UI frees
 static constexpr UINT WM_APP_UI_EVENT = WM_APP + 2;
 
 enum class UiEventKind : int
@@ -494,369 +483,685 @@ struct UiEvent
 	std::wstring text;
 };
 
-static bool PostUiEvent(UiEvent* ev)
+static bool PostUiEventTo(HWND hwnd, UiEvent* ev)
 {
 	if (!ev) return false;
-	if (!g_state || !g_state->hMainWnd)
+	if (!hwnd)
 	{
 		delete ev;
 		return false;
 	}
-	if (PostMessageW(g_state->hMainWnd, WM_APP_UI_EVENT, 0, (LPARAM)ev))
+	if (PostMessageW(hwnd, WM_APP_UI_EVENT, 0, (LPARAM)ev))
 		return true;
 	delete ev;
 	return false;
 }
+
+static bool PostUiEvent(UiEvent* ev)
+{
+	if (!g_state) { delete ev; return false; }
+	return PostUiEventTo(g_state->hMainWnd, ev);
+}
+
+// Small helpers to reduce boilerplate when posting unified UI events.
+static bool PostUiSimple(UiEventKind kind, size_t u1 = 0, size_t u2 = 0, void* ptr = nullptr)
+{
+	UiEvent* ev = new UiEvent();
+	ev->kind = kind;
+	ev->u1 = u1;
+	ev->u2 = u2;
+	ev->ptr = ptr;
+	return PostUiEvent(ev);
+}
+static bool PostUiText(UiEventKind kind, std::wstring text)
+{
+	UiEvent* ev = new UiEvent();
+	ev->kind = kind;
+	ev->text = std::move(text);
+	return PostUiEvent(ev);
+}
 // --------------------------------------------------
 // PROGRESS BAR (FIXED: dynamic marquee style toggle)
 // --------------------------------------------------
-static void SetProgressMarquee(AppState* st, bool on)
+// ============================================================
+// UI / Progress / Output helper utilities (grouped & declared)
+// ============================================================
+namespace helpers
 {
-	if (!st || !st->hProgress) return;
-	LONG_PTR style = GetWindowLongPtrW(st->hProgress, GWL_STYLE);
-	if (on)
+	// Forward declarations (to keep helpers organized and avoid order issues)
+	static void EnableCtl(HWND h, bool enable);
+	static void ShowCtl(HWND h, bool show);
+	static void SetTextCtl(HWND h, std::wstring_view text);
+
+	// UI thread guard (debug-only)
+	static void AssertUiThread(AppState* st);
+
+	struct UiStatus { bool ok = true; DWORD winerr = 0; std::wstring msg; };
+	static UiStatus UiOk();
+	static UiStatus UiFail(DWORD winerr, std::wstring msg);
+
+	static void SetProgressMarquee(AppState* st, bool on);
+	static void FreezeProgressOnCancel(AppState* st);
+	static bool GateProgressUpdate(AppState* st);
+
+	static void SetUiForWorkerRunning(AppState* st, bool running);
+	static void SetProgressVisible(AppState* st, bool visible);
+	static void SetStatusText(AppState* st, std::wstring_view text);
+
+	static std::wstring GetOutputTextW_Impl(AppState* st);
+	static std::wstring GetOutputTextW(AppState* st);
+	static std::wstring GetOutputTextW();
+
+	static void OutputAppendTextW(AppState* st, std::wstring_view text);
+	static void OutputSetTextW(AppState* st, std::wstring_view text, bool scrollTop);
+
+	static void UpdateLogActionButtonsEnabled(AppState* st);
+	static void UpdateCheckUpdatesButtonEnabled(AppState* st);
+	static void UpdateHelpButtonEnabled(AppState* st);
+
+	struct ProgressUpdate;
+	static void ApplyProgressUpdate(AppState* st, const ProgressUpdate& u);
+
+	enum class UiMode;
+	static void ApplyUiMode(AppState* st, UiMode mode);
+
+	static void AppendToOutputW(AppState* st, const std::wstring& s);
+	static void AppendToOutputW(const std::wstring& s);
+	static void ClearOutput(AppState* st);
+	static void ClearOutput();
+	static void LoadHelpTextIntoOutput(AppState* st);
+	static void LoadHelpTextIntoOutput();
+	static void CopyOutputToClipboard(AppState* st);
+	static void CopyOutputToClipboard();
+	static void SaveOutputToFile(AppState* st);
+	static void SaveOutputToFile();
+	static UiStatus UiOk() { return UiStatus{}; }
+	static UiStatus UiFail(DWORD winerr, std::wstring msg) { UiStatus s; s.ok = false; s.winerr = winerr; s.msg = std::move(msg); return s; }
+	static void AssertUiThread(AppState* st)
 	{
-		if (!st->progressMarqueeOn)
+#if defined(_DEBUG)
+		if (st && st->uiThreadId != 0)
 		{
-			// Add PBS_MARQUEE style only when needed
-			style |= PBS_MARQUEE;
-			SetWindowLongPtrW(st->hProgress, GWL_STYLE, style);
-			SetWindowPos(st->hProgress, nullptr, 0, 0, 0, 0,
-				SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-			// Turn marquee on
-			SendMessageW(st->hProgress, PBM_SETMARQUEE, TRUE, 30);
-			st->progressMarqueeOn = true;
-		}
-	}
-	else
-	{
-		if (st->progressMarqueeOn)
-		{
-			// Turn marquee off first
-			SendMessageW(st->hProgress, PBM_SETMARQUEE, FALSE, 0);
-			// Remove PBS_MARQUEE so it draws as a normal smooth bar (prevents  segmented bars  look)
-			style &= ~PBS_MARQUEE;
-			SetWindowLongPtrW(st->hProgress, GWL_STYLE, style);
-			SetWindowPos(st->hProgress, nullptr, 0, 0, 0, 0,
-				SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-			// Reset to a clean deterministic state
-			SendMessageW(st->hProgress, PBM_SETRANGE32, 0, 1);
-			SendMessageW(st->hProgress, PBM_SETPOS, 0, 0);
-			st->progressMarqueeOn = false;
-		}
-	}
-}
-static void FreezeProgressOnCancel(AppState* st)
-{
-	if (!st || !st->hProgress) return;
-	// Once frozen, ignore any later progress/marquee messages.
-	st->progressFrozenOnCancel = true;
-	// Ensure marquee is off and show as fully filled.
-	SetProgressMarquee(st, false);
-	int total = st->progressTotal;
-	if (total <= 0) total = 100;
-	SendMessageW(st->hProgress, PBM_SETRANGE32, 0, total);
-	SendMessageW(st->hProgress, PBM_SETPOS, total, 0);
-}
-
-// --------------------------------------------------
-// UI output helpers (main thread)
-// --------------------------------------------------
-static std::wstring GetOutputTextW()
-{
-	if (!g_state || !g_state->hOutput) return L"";
-	const int len = GetWindowTextLengthW(g_state->hOutput);
-	if (len <= 0) return L"";
-
-	std::wstring buf;
-	buf.resize((size_t)len);
-	GetWindowTextW(g_state->hOutput, buf.data(), len + 1);
-	return buf;
-}
-
-static void UpdateLogActionButtonsEnabled()
-{
-	if (!g_state) return;
-	if (g_state->isRunning.load())
-	{
-		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
-		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
-		return;
-	}
-	if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
-	if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
-}
-
-static void UpdateCheckUpdatesButtonEnabled()
-{
-	if (!g_state || !g_state->hCheckUpdatesBtn) return;
-	const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
-	EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
-}
-
-static void UpdateHelpButtonEnabled()
-{
-	if (!g_state || !g_state->hHelpBtn) return;
-	const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
-	EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
-}
-
-
-// --------------------------------------------------
-// Unified UI toggle when a worker (sync/remove) is running.
-// Requirement: disable every button except Cancel Sync while running.
-// --------------------------------------------------
-static void SetUiForWorkerRunning(AppState* st, bool running)
-{
-	if (!st) return;
-
-	// Disable everything except Cancel while running.
-	if (st->hBrowseBtn) EnableWindow(st->hBrowseBtn, running ? FALSE : TRUE);
-	if (st->hRunButton) EnableWindow(st->hRunButton, running ? FALSE : TRUE);
-	if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, running ? FALSE : TRUE);
-	if (st->hFolderEdit) EnableWindow(st->hFolderEdit, running ? FALSE : TRUE);
-	if (st->hHelpBtn && running) EnableWindow(st->hHelpBtn, FALSE);
-
-	// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
-	// We hard-disable them here when running; when idle we defer to the existing helper logic.
-	if (running)
-	{
-		if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, FALSE);
-		if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, FALSE);
-		if (st->hCheckUpdatesBtn) EnableWindow(st->hCheckUpdatesBtn, FALSE);
-	}
-	else
-	{
-		UpdateLogActionButtonsEnabled();
-		UpdateCheckUpdatesButtonEnabled();
-		UpdateHelpButtonEnabled();
-	}
-
-	// Cancel is the inverse (only enabled while running).
-	if (st->hCancelBtn) EnableWindow(st->hCancelBtn, running ? TRUE : FALSE);
-}
-
-static void AppendToOutputW(const wchar_t* text)
-{
-	if (!g_state || !g_state->hOutput || !text) return;
-	const LRESULT len = SendMessageW(g_state->hOutput, WM_GETTEXTLENGTH, 0, 0);
-	SendMessageW(g_state->hOutput, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-	SendMessageW(g_state->hOutput, EM_REPLACESEL, FALSE, (LPARAM)text);
-	SendMessageW(g_state->hOutput, EM_SCROLLCARET, 0, 0);
-	UpdateLogActionButtonsEnabled();
-}
-
-static void ClearOutput()
-{
-	if (g_state && g_state->hOutput)
-		SetWindowTextW(g_state->hOutput, L"");
-	UpdateLogActionButtonsEnabled();
-}
-
-// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
-// - If clearFirst is true, the output is cleared before loading.
-// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
-static bool LoadHelpTextIntoOutput(bool clearFirst, bool showErrorBox)
-{
-	if (!g_state || !g_state->hOutput)
-		return false;
-
-	if (clearFirst)
-		ClearOutput();
-
-	fs::path exePath = GetThisExePath();
-	fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
-
-	std::ifstream in(txtPath, std::ios::binary);
-	if (!in)
-	{
-		if (showErrorBox)
-		{
-			std::wstring msg = L"Could not open:\r\n\r\n" + txtPath.wstring();
-			MessageBoxW(g_state->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-		}
-		return false;
-	}
-
-	std::string bytes;
-	in.seekg(0, std::ios::end);
-	std::streamoff sz = in.tellg();
-	if (sz < 0) sz = 0;
-	bytes.resize((size_t)sz);
-	in.seekg(0, std::ios::beg);
-	if (!bytes.empty())
-		in.read(bytes.data(), (std::streamsize)bytes.size());
-
-	std::wstring textW;
-	const unsigned char* b = (const unsigned char*)bytes.data();
-	const size_t n = bytes.size();
-	if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
-	{
-		// UTF-16 LE BOM
-		const size_t wcharCount = (n - 2) / 2;
-		textW.assign((const wchar_t*)(b + 2), (const wchar_t*)(b + 2) + wcharCount);
-	}
-	else
-	{
-		size_t start = 0;
-		if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
-			start = 3; // UTF-8 BOM
-		textW = Utf8ToWide(bytes.substr(start));
-	}
-
-	SetWindowTextW(g_state->hOutput, textW.c_str());
-	// Scroll to top
-	SendMessageW(g_state->hOutput, EM_SETSEL, 0, 0);
-	SendMessageW(g_state->hOutput, EM_SCROLLCARET, 0, 0);
-	SendMessageW(g_state->hOutput, WM_VSCROLL, SB_TOP, 0);
-	UpdateLogActionButtonsEnabled();
-	return true;
-}
-
-static bool CopyOutputToClipboard()
-{
-	if (!g_state || !g_state->hMainWnd) return false;
-	std::wstring textW = GetOutputTextW();
-	if (textW.empty())
-	{
-		MessageBoxW(g_state->hMainWnd, L"Log is empty. Nothing to Copy!", L"Copy Log", MB_OK | MB_ICONINFORMATION);
-		return false;
-	}
-	if (!OpenClipboard(g_state->hMainWnd))
-	{
-		MessageBoxW(g_state->hMainWnd, L"Failed to open the clipboard.", L"Copy Log", MB_OK | MB_ICONERROR);
-		return false;
-	}
-	EmptyClipboard();
-	const size_t bytes = (textW.size() + 1) * sizeof(wchar_t);
-	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-	if (!hMem)
-	{
-		CloseClipboard();
-		MessageBoxW(g_state->hMainWnd, L"Failed to allocate clipboard memory.", L"Copy Log", MB_OK | MB_ICONERROR);
-		return false;
-	}
-	void* pMem = GlobalLock(hMem);
-	if (!pMem)
-	{
-		GlobalFree(hMem);
-		CloseClipboard();
-		MessageBoxW(g_state->hMainWnd, L"Failed to lock clipboard memory.", L"Copy Log", MB_OK | MB_ICONERROR);
-		return false;
-	}
-	memcpy(pMem, textW.c_str(), bytes);
-	GlobalUnlock(hMem);
-	if (!SetClipboardData(CF_UNICODETEXT, hMem))
-	{
-		GlobalFree(hMem);
-		CloseClipboard();
-		MessageBoxW(g_state->hMainWnd, L"Failed to set clipboard data.", L"Copy Log", MB_OK | MB_ICONERROR);
-		return false;
-	}
-	// clipboard owns hMem now
-	CloseClipboard();
-	MessageBoxW(g_state->hMainWnd, L"Log has been copied to clipboard", L"Copy Log", MB_OK | MB_ICONINFORMATION);
-	return true;
-}
-static void SaveOutputToFile()
-{
-	if (!g_state || !g_state->hMainWnd) return;
-	std::wstring textW = GetOutputTextW();
-	if (textW.empty())
-	{
-		MessageBoxW(g_state->hMainWnd, L"Log is empty. Nothing to Save!", L"Save Log", MB_OK | MB_ICONINFORMATION);
-		return;
-	}
-
-	wchar_t filePath[MAX_PATH]{};
-	// Default filename includes Unix epoch time (seconds).
-	const time_t epoch = time(nullptr);
-	std::wstring defaultName = L"MapPackSyncTool_" + std::to_wstring((long long)epoch) + L"_Log.txt";
-	wcsncpy_s(filePath, defaultName.c_str(), _TRUNCATE);
-
-	OPENFILENAMEW ofn{};
-	ofn.lStructSize = sizeof(ofn);
-	ofn.hwndOwner = g_state->hMainWnd;
-	ofn.lpstrFile = filePath;
-	ofn.nMaxFile = (DWORD)_countof(filePath);
-	ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
-	ofn.nFilterIndex = 1;
-	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-	ofn.lpstrDefExt = L"txt";
-	ofn.lpstrTitle = L"Save Log As";
-	// Initial directory behavior:
-	//  - If we have a remembered directory from a previous save, start there.
-	//  - Otherwise, default to: <FolderEdit>\resources_override\mappack (if it exists).
-	std::wstring initialDir;
-	if (!g_lastSaveDir.empty())
-	{
-		ofn.lpstrInitialDir = g_lastSaveDir.c_str();
-	}
-	else if (g_state->hFolderEdit)
-	{
-		wchar_t base[MAX_PATH]{};
-		GetWindowTextW(g_state->hFolderEdit, base, (int)_countof(base));
-		if (base[0] != L'\0')
-		{
-			try
+			DWORD tid = GetCurrentThreadId();
+			if (tid != st->uiThreadId)
 			{
-				fs::path p(base);
-				p /= L"resources_override";
-				p /= L"mappack";
-				if (fs::exists(p) && fs::is_directory(p))
-				{
-					initialDir = p.wstring();
-					ofn.lpstrInitialDir = initialDir.c_str();
-				}
+				// Break in debugger if a UI-only helper is called from a worker thread.
+				DebugBreak();
 			}
-			catch (...) {}
+		}
+#endif
+	}
+
+	static void SetProgressMarquee(AppState* st, bool on)
+	{
+		AssertUiThread(st);
+
+		if (!st || !st->hProgress) return;
+		LONG_PTR style = GetWindowLongPtrW(st->hProgress, GWL_STYLE);
+		if (on)
+		{
+			if (!st->progressMarqueeOn)
+			{
+				// Add PBS_MARQUEE style only when needed
+				style |= PBS_MARQUEE;
+				SetWindowLongPtrW(st->hProgress, GWL_STYLE, style);
+				SetWindowPos(st->hProgress, nullptr, 0, 0, 0, 0,
+					SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+				// Turn marquee on
+				SendMessageW(st->hProgress, PBM_SETMARQUEE, TRUE, 30);
+				st->progressMarqueeOn = true;
+			}
+		}
+		else
+		{
+			if (st->progressMarqueeOn)
+			{
+				// Turn marquee off first
+				SendMessageW(st->hProgress, PBM_SETMARQUEE, FALSE, 0);
+				// Remove PBS_MARQUEE so it draws as a normal smooth bar (prevents  segmented bars  look)
+				style &= ~PBS_MARQUEE;
+				SetWindowLongPtrW(st->hProgress, GWL_STYLE, style);
+				SetWindowPos(st->hProgress, nullptr, 0, 0, 0, 0,
+					SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+				// Reset to a clean deterministic state
+				SendMessageW(st->hProgress, PBM_SETRANGE32, 0, 1);
+				SendMessageW(st->hProgress, PBM_SETPOS, 0, 0);
+				st->progressMarqueeOn = false;
+			}
+		}
+	}
+	static void FreezeProgressOnCancel(AppState* st)
+	{
+		if (!st || !st->hProgress) return;
+		// Once frozen, ignore any later progress/marquee messages.
+		st->progressFrozenOnCancel = true;
+		// Ensure marquee is off and show as fully filled.
+		SetProgressMarquee(st, false);
+		int total = st->progressTotal;
+		if (total <= 0) total = 100;
+		SendMessageW(st->hProgress, PBM_SETRANGE32, 0, total);
+		SendMessageW(st->hProgress, PBM_SETPOS, total, 0);
+	}
+
+	static inline bool GateProgressUpdate(AppState* st)
+	{
+		if (!st) return false;
+		if (st->cancelRequested.load(std::memory_order_relaxed) || st->progressFrozenOnCancel)
+		{
+			FreezeProgressOnCancel(st);
+			return false;
+		}
+		return true;
+	}
+
+
+	// --------------------------------------------------
+	// UI output helpers (main thread)
+	// --------------------------------------------------
+	static std::wstring GetOutputTextW_Impl(AppState* st)
+	{
+		if (!st || !st->hOutput) return L"";
+		const int len = GetWindowTextLengthW(st->hOutput);
+		if (len <= 0) return L"";
+
+		std::wstring buf;
+		buf.resize((size_t)len);
+		GetWindowTextW(st->hOutput, buf.data(), len + 1);
+		return buf;
+	}
+
+	// Back-compat wrapper used by existing call sites.
+	static std::wstring GetOutputTextW(AppState* st)
+	{
+		return GetOutputTextW_Impl(st);
+	}
+
+	static std::wstring GetOutputTextW()
+	{
+		return GetOutputTextW_Impl(g_state);
+	}
+
+
+	static void UpdateLogActionButtonsEnabled();
+
+	static void OutputAppendTextW(AppState* st, std::wstring_view text)
+	{
+		AssertUiThread(st);
+
+		if (!st || !st->hOutput) return;
+		if (text.empty()) return;
+
+		const LRESULT len = SendMessageW(st->hOutput, WM_GETTEXTLENGTH, 0, 0);
+		SendMessageW(st->hOutput, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+
+		std::wstring tmp(text);
+		SendMessageW(st->hOutput, EM_REPLACESEL, FALSE, (LPARAM)tmp.c_str());
+		SendMessageW(st->hOutput, EM_SCROLLCARET, 0, 0);
+
+		UpdateLogActionButtonsEnabled();
+	}
+
+
+	// ------------------------------------------------------------
+	// Tiny control helpers (forward declarations)
+	// ------------------------------------------------------------
+	static void EnableCtl(HWND h, bool enabled);
+	static void ShowCtl(HWND h, bool visible);
+	static void SetTextCtl(HWND h, std::wstring_view text);
+
+	static void OutputSetTextW(AppState* st, std::wstring_view text, bool scrollTop)
+	{
+		AssertUiThread(st);
+
+		if (!st || !st->hOutput) return;
+
+		SetTextCtl(st->hOutput, text);
+
+		if (scrollTop)
+		{
+			SendMessageW(st->hOutput, EM_SETSEL, 0, 0);
+			SendMessageW(st->hOutput, EM_SCROLLCARET, 0, 0);
+			SendMessageW(st->hOutput, WM_VSCROLL, SB_TOP, 0);
+		}
+
+		UpdateLogActionButtonsEnabled();
+	}
+
+	static void UpdateLogActionButtonsEnabled()
+	{
+		if (!g_state) return;
+		if (g_state->isRunning.load())
+		{
+			if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
+			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
+			return;
+		}
+		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
+		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
+	}
+
+	static void UpdateCheckUpdatesButtonEnabled()
+	{
+		if (!g_state || !g_state->hCheckUpdatesBtn) return;
+		const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
+		EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+	}
+
+	static void UpdateHelpButtonEnabled()
+	{
+		if (!g_state || !g_state->hHelpBtn) return;
+		const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
+		EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
+	}
+
+
+	// --------------------------------------------------
+	// Unified UI toggle when a worker (sync/remove) is running.
+	// Requirement: disable every button except Cancel Sync while running.
+	// --------------------------------------------------
+	// --------------------------------------------------
+	// Tiny HWND helpers (reduce Win32 call boilerplate)
+	// --------------------------------------------------
+	static void EnableCtl(HWND h, bool enabled)
+	{
+		if (h) EnableWindow(h, enabled ? TRUE : FALSE);
+	}
+
+	static void ShowCtl(HWND h, bool visible)
+	{
+		if (h) ShowWindow(h, visible ? SW_SHOW : SW_HIDE);
+	}
+
+	static void SetTextCtl(HWND h, std::wstring_view text)
+	{
+		if (!h) return;
+		std::wstring tmp(text);
+		SetWindowTextW(h, tmp.c_str());
+	}
+
+
+	static void SetUiForWorkerRunning(AppState* st, bool running)
+	{
+		if (!st) return;
+
+		// Disable everything except Cancel while running.
+		EnableCtl(st->hBrowseBtn, !running);
+		EnableCtl(st->hRunButton, !running);
+		EnableCtl(st->hDeleteBtn, !running);
+		EnableCtl(st->hFolderEdit, !running);
+		if (running) EnableCtl(st->hHelpBtn, false);
+
+		// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
+		// We hard-disable them here when running; when idle we defer to the existing helper logic.
+		if (running)
+		{
+			EnableCtl(st->hCopyLogBtn, false);
+			EnableCtl(st->hSaveLogBtn, false);
+			EnableCtl(st->hCheckUpdatesBtn, false);
+		}
+		else
+		{
+			UpdateLogActionButtonsEnabled();
+			UpdateCheckUpdatesButtonEnabled();
+			UpdateHelpButtonEnabled();
+		}
+
+		// Cancel is the inverse (only enabled while running).
+		EnableCtl(st->hCancelBtn, running);
+	}
+
+
+	// --------------------------------------------------
+	// UI mode helpers (tight scope: reduce repeated enable/disable/show logic)
+	// --------------------------------------------------
+	enum class UiMode
+	{
+		Idle,
+		Running,
+		Canceling,
+	};
+
+	static void SetProgressVisible(AppState* st, bool visible)
+	{
+		AssertUiThread(st);
+
+		if (!st) return;
+		ShowCtl(st->hProgress, visible);
+		ShowCtl(st->hProgressText, visible);
+	}
+
+	static void SetStatusText(AppState* st, std::wstring_view text)
+	{
+		AssertUiThread(st);
+
+		if (!st || !st->hProgressText) return;
+		SetTextCtl(st->hProgressText, text);
+		InvalidateRect(st->hProgressText, nullptr, TRUE);
+	}
+
+	struct ProgressUpdate
+	{
+		bool ensureVisible = true;     // show progress controls unless caller explicitly hides them
+		bool setVisible = false;
+		bool visible = true;
+
+		bool setMarquee = false;
+		bool marquee = false;
+
+		bool setTotal = false;
+		size_t total = 0;
+
+		bool setPos = false;
+		size_t pos = 0;
+
+		bool setText = false;
+		std::wstring_view text{};
+	};
+
+	static void ApplyProgressUpdate(AppState* st, const ProgressUpdate& u)
+	{
+		AssertUiThread(st);
+
+		if (!st) return;
+
+		if (u.setVisible)
+		{
+			SetProgressVisible(st, u.visible);
+		}
+		else if (u.ensureVisible)
+		{
+			SetProgressVisible(st, true);
+		}
+
+		if (u.setMarquee)
+		{
+			SetProgressMarquee(st, u.marquee);
+		}
+
+		if (u.setTotal && st->hProgress)
+		{
+			int total = (int)u.total;
+			if (total <= 0) total = 1;
+			SendMessageW(st->hProgress, PBM_SETRANGE32, 0, total);
+			SendMessageW(st->hProgress, PBM_SETPOS, 0, 0);
+		}
+
+		if (u.setPos && st->hProgress)
+		{
+			SendMessageW(st->hProgress, PBM_SETPOS, (WPARAM)(int)u.pos, 0);
+		}
+
+		if (u.setText)
+		{
+			SetStatusText(st, u.text);
 		}
 	}
 
-	if (!GetSaveFileNameW(&ofn))
-		return;
 
-	// Remember the directory for next time.
-	try
+	static void ApplyUiMode(AppState* st, UiMode mode)
 	{
-		g_lastSaveDir = fs::path(ofn.lpstrFile).parent_path().wstring();
+		AssertUiThread(st);
+
+		if (!st) return;
+
+		switch (mode)
+		{
+		case UiMode::Idle:
+			SetUiForWorkerRunning(st, false);
+			// Leave progress controls visible; keep last message unless caller changes it.
+			SetProgressMarquee(st, false);
+			break;
+		case UiMode::Running:
+			SetUiForWorkerRunning(st, true);
+			SetProgressVisible(st, true);
+			break;
+		case UiMode::Canceling:
+			// Cancel has been requested; prevent repeat clicks but keep worker running.
+			SetUiForWorkerRunning(st, true);
+			EnableCtl(st->hCancelBtn, false);
+			break;
+		}
 	}
-	catch (...) {}
-
-	std::ofstream f(ofn.lpstrFile, std::ios::binary);
 
 
-	if (!f)
+	static void AppendToOutputW(const wchar_t* text)
 	{
-		MessageBoxW(g_state->hMainWnd, L"Failed to open file for writing.", L"Save Log", MB_OK | MB_ICONERROR);
-		return;
+		if (!text) return;
+		OutputAppendTextW(g_state, text);
 	}
 
-	// Write UTF-16LE with BOM so Notepad opens it reliably.
-	const unsigned char bom[2] = { 0xFF, 0xFE };
-	f.write((const char*)bom, 2);
-	f.write((const char*)textW.data(), (std::streamsize)textW.size() * (std::streamsize)sizeof(wchar_t));
+	static void ClearOutput(AppState* st)
+	{
+		OutputSetTextW(st, L"", false);
+	}
+	static void ClearOutput()
+	{
+		ClearOutput(g_state);
+	}
+	// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
+	// - If clearFirst is true, the output is cleared before loading.
+	// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
+	static bool LoadHelpTextIntoOutput(AppState* st, bool clearFirst, bool showErrorBox)
+	{
+		if (!st || !st->hOutput)
+			return false;
+
+		if (clearFirst)
+			ClearOutput();
+
+		fs::path exePath = GetThisExePath();
+		fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
+
+		std::ifstream in(txtPath, std::ios::binary);
+		if (!in)
+		{
+			if (showErrorBox)
+			{
+				std::wstring msg = L"Could not open:\r\n\r\n" + txtPath.wstring();
+				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			}
+			return false;
+		}
+
+		std::string bytes;
+		in.seekg(0, std::ios::end);
+		std::streamoff sz = in.tellg();
+		if (sz < 0) sz = 0;
+		bytes.resize((size_t)sz);
+		in.seekg(0, std::ios::beg);
+		if (!bytes.empty())
+			in.read(bytes.data(), (std::streamsize)bytes.size());
+
+		std::wstring textW;
+		const unsigned char* b = (const unsigned char*)bytes.data();
+		const size_t n = bytes.size();
+		if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+		{
+			// UTF-16 LE BOM
+			const size_t wcharCount = (n - 2) / 2;
+			textW.assign((const wchar_t*)(b + 2), (const wchar_t*)(b + 2) + wcharCount);
+		}
+		else
+		{
+			size_t start = 0;
+			if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
+				start = 3; // UTF-8 BOM
+			textW = Utf8ToWide(bytes.substr(start));
+		}
+
+		OutputSetTextW(st, textW, true);
+		return true;
+	}
+
+	static bool LoadHelpTextIntoOutput(bool clearFirst, bool showErrorBox)
+	{
+		return LoadHelpTextIntoOutput(g_state, clearFirst, showErrorBox);
+	}
+
+
+	static UiStatus CopyOutputToClipboard_Status(AppState* st)
+	{
+		AssertUiThread(st);
+		if (!st || !st->hMainWnd) return UiFail(0, L"Internal error: window handle is missing.");
+
+		std::wstring textW = GetOutputTextW(st);
+		if (textW.empty())
+			return UiFail(0, L"Log is empty. Nothing to Copy!");
+
+		if (!OpenClipboard(st->hMainWnd))
+			return UiFail(GetLastError(), L"Failed to open the clipboard.");
+
+		EmptyClipboard();
+
+		const size_t bytes = (textW.size() + 1) * sizeof(wchar_t);
+		HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+		if (!hMem)
+		{
+			DWORD err = GetLastError();
+			CloseClipboard();
+			return UiFail(err, L"Failed to allocate clipboard memory.");
+		}
+
+		void* pMem = GlobalLock(hMem);
+		if (!pMem)
+		{
+			DWORD err = GetLastError();
+			GlobalFree(hMem);
+			CloseClipboard();
+			return UiFail(err, L"Failed to lock clipboard memory.");
+		}
+
+		memcpy(pMem, textW.c_str(), bytes);
+		GlobalUnlock(hMem);
+
+		if (!SetClipboardData(CF_UNICODETEXT, hMem))
+		{
+			DWORD err = GetLastError();
+			GlobalFree(hMem);
+			CloseClipboard();
+			return UiFail(err, L"Failed to set clipboard data.");
+		}
+
+		// Clipboard owns hMem now.
+		CloseClipboard();
+		return UiOk();
+	}
+
+	static bool CopyOutputToClipboard_Impl(AppState* st)
+	{
+		UiStatus s = CopyOutputToClipboard_Status(st);
+		if (!s.ok)
+		{
+			MessageBoxW(st ? st->hMainWnd : nullptr, s.msg.c_str(), L"Copy Log", MB_OK | MB_ICONERROR);
+			return false;
+		}
+		MessageBoxW(st->hMainWnd, L"Log has been copied to clipboard", L"Copy Log", MB_OK | MB_ICONINFORMATION);
+		return true;
+	}
+
+	static bool CopyOutputToClipboard_Impl()
+	{
+		return CopyOutputToClipboard_Impl(g_state);
+	}
+
+
+
+	static void CopyOutputToClipboard(AppState* st)
+	{
+		(void)CopyOutputToClipboard_Impl(st);
+	}
+
+	static void CopyOutputToClipboard()
+	{
+		(void)CopyOutputToClipboard_Impl(g_state);
+	}
+	static void SaveOutputToFile(AppState* st)
+	{
+		if (!st || !st->hMainWnd) return;
+		std::wstring textW = GetOutputTextW(st);
+		if (textW.empty())
+		{
+			MessageBoxW(st->hMainWnd, L"Log is empty. Nothing to Save!", L"Save Log", MB_OK | MB_ICONINFORMATION);
+			return;
+		}
+
+		wchar_t filePath[MAX_PATH]{};
+		// Default filename includes Unix epoch time (seconds).
+		const time_t epoch = time(nullptr);
+		std::wstring defaultName = L"MapPackSyncTool_" + std::to_wstring((long long)epoch) + L"_Log.txt";
+		wcsncpy_s(filePath, defaultName.c_str(), _TRUNCATE);
+
+		OPENFILENAMEW ofn{};
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = st->hMainWnd;
+		ofn.lpstrFile = filePath;
+		ofn.nMaxFile = (DWORD)_countof(filePath);
+		ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+		ofn.nFilterIndex = 1;
+		ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+		ofn.lpstrDefExt = L"txt";
+		ofn.lpstrTitle = L"Save Log As";
+		// Initial directory behavior:
+		//  - If we have a remembered directory from a previous save, start there.
+		//  - Otherwise, default to: <FolderEdit>\resources_override\mappack (if it exists).
+		std::wstring initialDir;
+		if (!g_lastSaveDir.empty())
+		{
+			ofn.lpstrInitialDir = g_lastSaveDir.c_str();
+		}
+		else if (st->hFolderEdit)
+		{
+			wchar_t base[MAX_PATH]{};
+			GetWindowTextW(st->hFolderEdit, base, (int)_countof(base));
+			if (base[0] != L'\0')
+			{
+				try
+				{
+					fs::path p(base);
+					p /= L"resources_override";
+					p /= L"mappack";
+					if (fs::exists(p) && fs::is_directory(p))
+					{
+						initialDir = p.wstring();
+						ofn.lpstrInitialDir = initialDir.c_str();
+					}
+				}
+				catch (...) {}
+			}
+		}
+
+		if (!GetSaveFileNameW(&ofn))
+			return;
+
+		// Remember the directory for next time.
+		try
+		{
+			g_lastSaveDir = fs::path(ofn.lpstrFile).parent_path().wstring();
+		}
+		catch (...) {}
+
+		std::ofstream f(ofn.lpstrFile, std::ios::binary);
+
+
+		if (!f)
+		{
+			MessageBoxW(st->hMainWnd, L"Failed to open file for writing.", L"Save Log", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		// Write UTF-16LE with BOM so Notepad opens it reliably.
+		const unsigned char bom[2] = { 0xFF, 0xFE };
+		f.write((const char*)bom, 2);
+		f.write((const char*)textW.data(), (std::streamsize)textW.size() * (std::streamsize)sizeof(wchar_t));
+	}
+
+	static void SaveOutputToFile()
+	{
+		SaveOutputToFile(g_state);
+	}
 }
-static HFONT CreatePointFont(HWND hwndRef, int pointSize, const wchar_t* faceName, bool bold = false)
-{
-	HDC hdc = GetDC(hwndRef);
-	int logPixelsY = GetDeviceCaps(hdc, LOGPIXELSY);
-	ReleaseDC(hwndRef, hdc);
-	int height = -MulDiv(pointSize, logPixelsY, 72);
-	return CreateFontW(
-		height, 0, 0, 0,
-		bold ? FW_SEMIBOLD : FW_NORMAL,
-		FALSE, FALSE, FALSE,
-		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-		CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-		DEFAULT_PITCH | FF_DONTCARE,
-		faceName ? faceName : L"Segoe UI");
-}
-static void SetControlFont(HWND h, HFONT f)
-{
-	if (!h || !f) return;
-	SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE);
-}
+// Keep call sites unchanged (helpers remain effectively “global”)
+using namespace helpers;
 static void AddTooltip(HWND hwndTip, HWND hwndTarget, const wchar_t* tipText)
 {
 	if (!hwndTip || !hwndTarget || !tipText) return;
@@ -899,49 +1204,12 @@ static std::string PathToUtf8(const fs::path& p)
 {
 	return WideToUtf8(p.wstring());
 }
-static wchar_t* DupWideForPostUtf8(const std::string& s)
-{
-	std::wstring ws = Utf8ToWide(s);
-	size_t bytes = (ws.size() + 1) * sizeof(wchar_t);
-	wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, bytes);
-	if (!buf) return nullptr;
-	memcpy(buf, ws.c_str(), ws.size() * sizeof(wchar_t));
-	buf[ws.size()] = L'\0';
-	return buf;
-}
-static wchar_t* DupWideForPostW(const std::wstring& ws)
-{
-	size_t bytes = (ws.size() + 1) * sizeof(wchar_t);
-	wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, bytes);
-	if (!buf) return nullptr;
-	memcpy(buf, ws.c_str(), ws.size() * sizeof(wchar_t));
-	buf[ws.size()] = L'\0';
-	return buf;
-}
-static bool PostHeapMessageW(UINT msg, wchar_t* payload)
-{
-	if (!payload) return false;
-	if (!g_state || !g_state->hMainWnd)
-	{
-		HeapFree(GetProcessHeap(), 0, payload);
-		return false;
-	}
-	if (PostMessageW(g_state->hMainWnd, msg, 0, (LPARAM)payload))
-		return true;
-	HeapFree(GetProcessHeap(), 0, payload);
-	return false;
-}
 // Thread-safe log: posts to main thread
 static void Log(const std::string& textUtf8)
 {
 	// Thread-safe log: post a unified UI event carrying wide text.
-	wchar_t* w = DupWideForPostUtf8(textUtf8);
-	if (!w) return;
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::LogAppendW;
-	ev->text.assign(w);
-	HeapFree(GetProcessHeap(), 0, w);
-	PostUiEvent(ev);
+	std::wstring ws = Utf8ToWide(textUtf8);
+	PostUiText(UiEventKind::LogAppendW, std::move(ws));
 }
 static void LogSeparator(char ch = '_', size_t count = 150)
 {
@@ -955,36 +1223,27 @@ static void LogSeparator(char ch = '_', size_t count = 150)
 }
 static void PostProgressTextW(const std::wstring& textWide)
 {
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::ProgressTextW;
-	ev->text = textWide;
-	PostUiEvent(ev);
+	PostUiText(UiEventKind::ProgressTextW, textWide);
+}
+static void PostProgressTextW(std::wstring&& textWide)
+{
+	PostUiText(UiEventKind::ProgressTextW, std::move(textWide));
 }
 static void PostProgressMarqueeOn()
 {
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::ProgressMarqueeOn;
-	PostUiEvent(ev);
+	PostUiSimple(UiEventKind::ProgressMarqueeOn);
 }
 static void PostProgressMarqueeOff()
 {
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::ProgressMarqueeOff;
-	PostUiEvent(ev);
+	PostUiSimple(UiEventKind::ProgressMarqueeOff);
 }
 static void PostProgressInit(size_t total)
 {
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::ProgressInit;
-	ev->u1 = total;
-	PostUiEvent(ev);
+	PostUiSimple(UiEventKind::ProgressInit, total);
 }
 static void PostProgressSet(size_t pos)
 {
-	UiEvent* ev = new UiEvent();
-	ev->kind = UiEventKind::ProgressSet;
-	ev->u1 = pos;
-	PostUiEvent(ev);
+	PostUiSimple(UiEventKind::ProgressSet, pos);
 }
 static std::wstring MakeProgressFileLabel(const wchar_t* verb, size_t index1, size_t total, const std::string& relUtf8, const std::string* remoteUtf8 = nullptr)
 {
@@ -1768,38 +2027,6 @@ static bool HasDotDotSegment(const std::string& rawPath)
 	}
 	return false;
 }
-
-static bool IsSafeManifestPath(const std::string& rawPath, std::string* outErr)
-{
-	if (rawPath.empty()) { if (outErr) *outErr = "empty path"; return false; }
-
-	// Reject obvious absolute/UNC/drive paths
-	if (rawPath.size() >= 2 && std::isalpha((unsigned char)rawPath[0]) && rawPath[1] == ':')
-	{
-		if (outErr) *outErr = "absolute drive path not allowed";
-		return false;
-	}
-	if (rawPath.rfind("\\\\", 0) == 0 || rawPath.rfind("//", 0) == 0)
-	{
-		if (outErr) *outErr = "UNC path not allowed";
-		return false;
-	}
-
-	// Reject traversal segments
-	if (HasDotDotSegment(rawPath))
-	{
-		if (outErr) *outErr = "path traversal '..' not allowed";
-		return false;
-	}
-
-	// Basic control character check
-	for (unsigned char ch : rawPath)
-	{
-		if (ch < 0x20) { if (outErr) *outErr = "control character in path"; return false; }
-	}
-	return true;
-}
-
 static bool IsHex64(const std::string& s)
 {
 	if (s.size() != 64) return false;
@@ -1838,17 +2065,6 @@ static bool ValidateAndNormalizeManifest(const std::vector<ManifestRawEntry>& ra
 	std::unordered_set<std::string> dummySet;
 	return ValidateAndNormalizeManifest(rawFiles, outWorkList, dummySet, outErr);
 }
-static Status ParseManifestRaw_Status(const std::string& jsonText, std::vector<ManifestRawEntry>& outEntries)
-{
-	std::string err;
-	std::vector<ManifestRawEntry> tmp;
-	if (!ParseManifestRaw(jsonText, tmp, &err)) {
-		return Status::FailMsg(Utf8ToWide(err));
-	}
-	outEntries.swap(tmp);
-	return Status::Ok();
-}
-
 static bool ParseManifestRaw(const std::string& jsonText, std::vector<ManifestRawEntry>& outFiles, std::string* outErr)
 {
 	outFiles.clear();
@@ -2519,23 +2735,6 @@ static bool DownloadUrlToFileVerifySha256(
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
-static bool is_space(char c) { return c == ' ' || c == '	' || c == '\r' || c == '\n'; }
-static std::string ToLowerAscii(std::string s)
-{
-	for (char& c : s)
-		if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
-	return s;
-}
-static std::string StripQueryAndFragment(std::string s)
-{
-	size_t q = s.find('?');
-	size_t h = s.find('#');
-	size_t cut = std::string::npos;
-	if (q != std::string::npos) cut = q;
-	if (h != std::string::npos) cut = (cut == std::string::npos) ? h : (cut < h ? cut : h);
-	if (cut != std::string::npos) s.resize(cut);
-	return s;
-}
 static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false)
 {
 	std::error_code ec;
@@ -2836,10 +3035,6 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 }
 
 // which extensions to sync
-static bool IsSyncedExt(const std::string& lowerExt)
-{
-	return (lowerExt == ".def" || lowerExt == ".png");
-}
 // --------------------------------------------------
 // Folder picker
 // --------------------------------------------------
@@ -3253,14 +3448,14 @@ static void StartSyncIfNotRunning()
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
-	SetUiForWorkerRunning(g_state, true);
+	ApplyUiMode(g_state, UiMode::Running);
 	unsigned int tid = 0;
 	unique_handle worker(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &WorkerThreadProc, nullptr, 0, &tid)));
 	g_state->hWorkerThread = worker.release();
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		SetUiForWorkerRunning(g_state, false);
+		ApplyUiMode(g_state, UiMode::Idle);
 		Log("ERROR: Failed to start worker thread.");
 	}
 }
@@ -3316,14 +3511,14 @@ static void StartRemoveIfNotRunning()
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
-	SetUiForWorkerRunning(g_state, true);
+	ApplyUiMode(g_state, UiMode::Running);
 	unsigned int tid = 0;
 	unique_handle worker(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, &WorkerThreadProcRemove, nullptr, 0, &tid)));
 	g_state->hWorkerThread = worker.release();
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		SetUiForWorkerRunning(g_state, false);
+		ApplyUiMode(g_state, UiMode::Idle);
 		Log("ERROR: Failed to start remove worker thread.");
 	}
 }
@@ -4143,7 +4338,7 @@ static void StartCheckForUpdates()
 	uintptr_t waiter = _beginthreadex(nullptr, 0, [](void* param)->unsigned {
 		auto* pair = (std::pair<AppState*, UpdateResult*>*)param;
 		WaitForSingleObject(pair->first->hUpdateThread, INFINITE);
-		{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::UpdateResultPtr; ev->ptr = pair->second; PostMessageW(pair->first->hMainWnd, WM_APP_UI_EVENT, 0, (LPARAM)ev); }
+		{ UiEvent* ev = new UiEvent(); ev->kind = UiEventKind::UpdateResultPtr; ev->ptr = pair->second; PostUiEventTo(pair->first->hMainWnd, ev); }
 		delete pair;
 		return 0;
 		}, new std::pair<AppState*, UpdateResult*>(st, res), 0, nullptr);
@@ -4184,7 +4379,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		std::wstring path;
 		if (BrowseForFolder(hwnd, path))
 		{
-			SetWindowTextW(st->hFolderEdit, path.c_str());
+			SetTextCtl(st->hFolderEdit, path.c_str());
 			// Persist selection for next launch (INI created on first write).
 			if (!path.empty())
 				IniWriteLastFolder(path);
@@ -4215,7 +4410,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		if (st && st->isRunning.load())
 		{
 			st->cancelRequested.store(true);
-			EnableWindow(st->hCancelBtn, FALSE);
+			ApplyUiMode(st, UiMode::Canceling);
 			PostProgressTextW(L"Cancel requested... finishing current transfer.");
 			Log("INFO: Cancel sync requested.\r\n");
 		}
@@ -4323,9 +4518,9 @@ static LRESULT HandleWmClose(AppState* st, HWND hwnd)
 		{
 			st->cancelRequested.store(true);
 			st->pendingExitAfterWorker = true;
-			if (st->hCancelBtn) EnableWindow(st->hCancelBtn, FALSE);
+			if (st->hCancelBtn) EnableCtl(st->hCancelBtn, false);
 			FreezeProgressOnCancel(st);
-			if (st->hDeleteBtn) EnableWindow(st->hDeleteBtn, TRUE);
+			EnableCtl(st->hDeleteBtn, true);
 			PostProgressTextW(L"Cancel requested... exiting when safe.");
 			Log("INFO: Window close requested during sync; canceling.\r\n");
 			return 0;
@@ -4349,6 +4544,97 @@ static LRESULT HandleWmDestroy(AppState* st, HWND hwnd)
 	return DefWindowProc(hwnd, WM_DESTROY, 0, 0);
 }
 
+
+static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
+{
+	std::unique_ptr<UiEvent> ev((UiEvent*)lParam);
+	if (!ev) return 0;
+
+	AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	if (!st2) st2 = g_state;
+
+	switch (ev->kind)
+	{
+	case UiEventKind::LogAppendW:
+		AppendToOutputW(ev->text.c_str());
+		break;
+	case UiEventKind::ProgressMarqueeOn:
+		if (GateProgressUpdate(st2))
+		{
+			ProgressUpdate u;
+			u.setMarquee = true;
+			u.marquee = true;
+			ApplyProgressUpdate(st2, u);
+		}
+		break;
+	case UiEventKind::ProgressMarqueeOff:
+		if (GateProgressUpdate(st2))
+		{
+			ProgressUpdate u;
+			u.setMarquee = true;
+			u.marquee = false;
+			ApplyProgressUpdate(st2, u);
+		}
+		break;
+	case UiEventKind::ProgressInit:
+		if (st2 && st2->hProgress)
+		{
+			int total = (int)ev->u1;
+			if (total <= 0) total = 1;
+			st2->progressTotal = total;
+			st2->progressPos = 0;
+			if (!GateProgressUpdate(st2)) break;
+
+			ProgressUpdate u;
+			u.setMarquee = true;
+			u.marquee = false;
+			u.setTotal = true;
+			u.total = (size_t)total;
+			u.setPos = true;
+			u.pos = 0;
+			ApplyProgressUpdate(st2, u);
+		}
+		break;
+	case UiEventKind::ProgressSet:
+		if (st2 && st2->hProgress)
+		{
+			int pos = (int)ev->u1;
+			st2->progressPos = pos;
+			if (!GateProgressUpdate(st2)) break;
+
+			ProgressUpdate u;
+			u.setMarquee = true;
+			u.marquee = false;
+			u.setPos = true;
+			u.pos = (size_t)pos;
+			ApplyProgressUpdate(st2, u);
+		}
+		break;
+	case UiEventKind::ProgressTextW:
+	{
+		ProgressUpdate u;
+		u.setText = true;
+		u.text = ev->text;
+		ApplyProgressUpdate(st2, u);
+	}
+	break;
+	case UiEventKind::WorkerDone:
+		if (st2)
+		{
+			ApplyUiMode(st2, UiMode::Idle);
+			if (st2->hWorkerThread) { CloseHandle(st2->hWorkerThread); st2->hWorkerThread = nullptr; }
+			if (st2->pendingExitAfterWorker) { DestroyWindow(hwnd); }
+		}
+		break;
+	case UiEventKind::UpdateResultPtr:
+		// Transfer ownership of UpdateResult* to the existing handler via lParam.
+		return HandleWmAppUpdateResult(st2, hwnd, 0, (LPARAM)ev->ptr);
+	default:
+		break;
+	}
+	return 0;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	AppState* st = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -4356,173 +4642,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg)
 	{
 	case WM_APP_UI_EVENT:
-	{
-		std::unique_ptr<UiEvent> ev((UiEvent*)lParam);
-		if (!ev) return 0;
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (!st2) st2 = g_state;
-		switch (ev->kind)
-		{
-		case UiEventKind::LogAppendW:
-			AppendToOutputW(ev->text.c_str());
-			break;
-		case UiEventKind::ProgressMarqueeOn:
-			if (st2)
-			{
-				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
-				SetProgressMarquee(st2, true);
-			}
-			break;
-		case UiEventKind::ProgressMarqueeOff:
-			if (st2)
-			{
-				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
-				SetProgressMarquee(st2, false);
-			}
-			break;
-		case UiEventKind::ProgressInit:
-			if (st2 && st2->hProgress)
-			{
-				int total = (int)ev->u1;
-				if (total <= 0) total = 1;
-				st2->progressTotal = total;
-				st2->progressPos = 0;
-				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
-				SetProgressMarquee(st2, false);
-				SendMessageW(st2->hProgress, PBM_SETRANGE32, 0, total);
-				SendMessageW(st2->hProgress, PBM_SETPOS, 0, 0);
-			}
-			break;
-		case UiEventKind::ProgressSet:
-			if (st2 && st2->hProgress)
-			{
-				int pos = (int)ev->u1;
-				st2->progressPos = pos;
-				if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel) { FreezeProgressOnCancel(st2); break; }
-				SetProgressMarquee(st2, false);
-				SendMessageW(st2->hProgress, PBM_SETPOS, (WPARAM)pos, 0);
-			}
-			break;
-		case UiEventKind::ProgressTextW:
-			if (st2 && st2->hProgressText)
-			{
-				SetWindowTextW(st2->hProgressText, ev->text.c_str());
-				InvalidateRect(st2->hProgressText, nullptr, TRUE);
-			}
-			break;
-		case UiEventKind::WorkerDone:
-			if (st2)
-			{
-				SetUiForWorkerRunning(st2, false);
-				if (st2->hWorkerThread) { CloseHandle(st2->hWorkerThread); st2->hWorkerThread = nullptr; }
-				if (st2->pendingExitAfterWorker) { DestroyWindow(hwnd); }
-			}
-			break;
-		case UiEventKind::UpdateResultPtr:
-			// Transfer ownership of UpdateResult* to the existing handler via lParam.
-			return HandleWmAppUpdateResult(st2, hwnd, 0, (LPARAM)ev->ptr);
-		default:
-			break;
-		}
-		return 0;
-	}
-	case WM_APP_LOG:
-	{
-		unique_heap_wstr w((wchar_t*)lParam);
-		if (w)
-		{
-			AppendToOutputW(w.get());
-		}
-		return 0;
-	}
-	case WM_APP_WORKER_DONE:
-	{
-		if (st)
-		{
-			SetUiForWorkerRunning(st, false);
-			if (st->hWorkerThread)
-			{
-				CloseHandle(st->hWorkerThread);
-				st->hWorkerThread = nullptr;
-			}
-			if (st->pendingExitAfterWorker)
-			{
-				DestroyWindow(hwnd);
-				return 0;
-			}
-		}
-		return 0;
-	}
-	case WM_APP_PROGRESS_MARQ_ON:
-	{
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (!st2) return 0;
-		if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel)
-		{
-			FreezeProgressOnCancel(st2);
-			return 0;
-		}
-		SetProgressMarquee(st2, true);
-		return 0;
-	}
-	case WM_APP_PROGRESS_MARQ_OFF:
-	{
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (!st2) return 0;
-		if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel)
-		{
-			FreezeProgressOnCancel(st2);
-			return 0;
-		}
-		SetProgressMarquee(st2, false);
-		return 0;
-	}
-	case WM_APP_PROGRESS_INIT:
-	{
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (st2 && st2->hProgress)
-		{
-			int total = (int)wParam;
-			if (total <= 0) total = 1;
-			st2->progressTotal = total;
-			st2->progressPos = 0;
-			if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel)
-			{
-				FreezeProgressOnCancel(st2);
-				return 0;
-			}
-			// Ensure marquee is fully off before switching to normal range/pos
-			SetProgressMarquee(st2, false);
-			SendMessageW(st2->hProgress, PBM_SETRANGE32, 0, total);
-			SendMessageW(st2->hProgress, PBM_SETPOS, 0, 0);
-		}
-		return 0;
-	}
-	case WM_APP_PROGRESS_SET:
-	{
-		AppState* st2 = (AppState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-		if (st2 && st2->hProgress)
-		{
-			int pos = (int)wParam;
-			st2->progressPos = pos;
-			if (st2->cancelRequested.load(std::memory_order_relaxed) || st2->progressFrozenOnCancel)
-			{
-				FreezeProgressOnCancel(st2);
-				return 0;
-			}
-			// If we somehow left marquee on, force it off
-			SetProgressMarquee(st2, false);
-			SendMessageW(st2->hProgress, PBM_SETPOS, (WPARAM)pos, 0);
-		}
-		return 0;
-	}
-	case WM_APP_PROGRESS_TEXT:
-	{
-		unique_heap_wstr w((wchar_t*)lParam);
-		if (g_state && g_state->hProgressText)
-			SetWindowTextW(g_state->hProgressText, w ? w.get() : L"");
-		return 0;
-	}
+		return HandleWmAppUiEvent(hwnd, lParam);
 	case WM_SIZE:
 		return HandleWmSize(hwnd, wParam, lParam);
 	case WM_GETMINMAXINFO:
@@ -4545,6 +4665,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 {
 	static AppState state;
 	g_state = &state;
+	state.uiThreadId = GetCurrentThreadId();
 	// Helper mode: apply an update after the main process exits.
 	int argc = 0;
 	wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -4615,7 +4736,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	{
 		std::wstring last = IniReadLastFolder();
 		if (!last.empty())
-			SetWindowTextW(g_state->hFolderEdit, last.c_str());
+			SetTextCtl(g_state->hFolderEdit, last.c_str());
 	}
 
 	// ===== DEBUG DEFAULT PATH =====
@@ -4623,7 +4744,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 #if defined(DEBUG_MESSAGE)
 	// Debug preset only if INI didn't already supply a value.
 	if (GetWindowTextLengthW(g_state->hFolderEdit) == 0)
-		SetWindowTextW(g_state->hFolderEdit, L"C:\\temp\\defs2");
+		SetTextCtl(g_state->hFolderEdit, L"C:\\temp\\defs2");
 #endif
 	// ==============================
 
