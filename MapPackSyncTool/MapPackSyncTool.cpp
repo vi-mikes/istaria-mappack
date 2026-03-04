@@ -4467,7 +4467,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			UpdateHelpButtonEnabled();
 			// Clear then load MapPackSyncTool.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
-			SetWindowTextW(g_state->hProgressText, L"Ready");
+			SetWindowTextW(g_state->hProgressText, L"");
 		}
 	}
 
@@ -4806,7 +4806,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	SendMessageW(g_state->hProgress, PBM_SETRANGE32, 0, 1);
 	SendMessageW(g_state->hProgress, PBM_SETPOS, 0, 0);
 	g_state->hProgressText = CreateWindowExW(
-		WS_EX_CLIENTEDGE, L"STATIC", L"Ready",
+		WS_EX_CLIENTEDGE, L"STATIC", L"",
 		WS_CHILD | WS_VISIBLE,
 		10, 60, 800, 22,
 		g_state->hMainWnd, (HMENU)2002, hInst, nullptr);
