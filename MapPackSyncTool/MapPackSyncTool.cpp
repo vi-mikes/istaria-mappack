@@ -4467,6 +4467,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			UpdateHelpButtonEnabled();
 			// Clear then load MapPackSyncTool.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
+			SetWindowTextW(g_state->hProgressText, L"Ready");
 		}
 	}
 
