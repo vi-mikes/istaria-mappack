@@ -566,6 +566,8 @@ namespace helpers
 	enum class UiMode;
 	static void ApplyUiMode(AppState* st, UiMode mode);
 
+	static void ResetUiToIdle(AppState* st);
+
 	static void AppendToOutputW(AppState* st, const std::wstring& s);
 	static void AppendToOutputW(const std::wstring& s);
 	static void ClearOutput(AppState* st);
@@ -806,6 +808,13 @@ namespace helpers
 			ShowCtl(h, visible);
 	}
 
+
+	static void SetTextMany(std::wstring_view text, std::initializer_list<HWND> ctrls)
+	{
+		for (HWND h : ctrls)
+			SetTextCtl(h, text);
+	}
+
 	static void SetTextCtl(HWND h, std::wstring_view text)
 	{
 		if (!h) return;
@@ -863,7 +872,7 @@ namespace helpers
 		AssertUiThread(st);
 
 		if (!st || !st->hProgressText) return;
-		SetTextCtl(st->hProgressText, text);
+		SetTextMany(text, { st->hProgressText });
 		InvalidateRect(st->hProgressText, nullptr, TRUE);
 	}
 
@@ -950,6 +959,20 @@ namespace helpers
 			break;
 		}
 	}
+
+	static void ResetUiToIdle(AppState* st)
+	{
+		AssertUiThread(st);
+		if (!st) return;
+
+		ApplyUiMode(st, UiMode::Idle);
+
+		UpdateLogActionButtonsEnabled(st);
+		UpdateCheckUpdatesButtonEnabled(st);
+		UpdateHelpButtonEnabled(st);
+	}
+
+
 
 
 	static void AppendToOutputW(const wchar_t* text)
@@ -3551,7 +3574,7 @@ static void StartSyncIfNotRunning()
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		ApplyUiMode(g_state, UiMode::Idle);
+		ResetUiToIdle(g_state);
 		Log("ERROR: Failed to start worker thread.");
 	}
 }
@@ -3614,7 +3637,7 @@ static void StartRemoveIfNotRunning()
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		ApplyUiMode(g_state, UiMode::Idle);
+		ResetUiToIdle(g_state);
 		Log("ERROR: Failed to start remove worker thread.");
 	}
 }
@@ -4825,7 +4848,7 @@ static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
 	case UiEventKind::WorkerDone:
 		if (st2)
 		{
-			ApplyUiMode(st2, UiMode::Idle);
+			ResetUiToIdle(st2);
 			if (st2->hWorkerThread) { CloseHandle(st2->hWorkerThread); st2->hWorkerThread = nullptr; }
 			if (st2->pendingExitAfterWorker) { DestroyWindow(hwnd); }
 		}
