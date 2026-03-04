@@ -55,6 +55,7 @@ Notes
 #include <cstring>     // memcpy
 #include <cstdint>
 #include <functional>  // std::function
+#include <initializer_list>
 #include <memory>      // std::unique_ptr
 #include <winhttp.h>
 
@@ -706,7 +707,9 @@ namespace helpers
 	// Tiny control helpers (forward declarations)
 	// ------------------------------------------------------------
 	static void EnableCtl(HWND h, bool enabled);
+	static void EnableMany(bool enabled, std::initializer_list<HWND> ctrls);
 	static void ShowCtl(HWND h, bool visible);
+	static void ShowMany(bool visible, std::initializer_list<HWND> ctrls);
 	static void SetTextCtl(HWND h, std::wstring_view text);
 
 	static void OutputSetTextW(AppState* st, std::wstring_view text, bool scrollTop)
@@ -727,36 +730,50 @@ namespace helpers
 		UpdateLogActionButtonsEnabled();
 	}
 
-	static void UpdateLogActionButtonsEnabled()
+	static void UpdateLogActionButtonsEnabled(AppState* st)
 	{
-		if (!g_state) return;
+		if (!st) return;
 
-		// While a worker is running, these actions must remain disabled.
-		if (g_state->isRunning.load())
+		// While a worker runs, log actions are always disabled.
+		if (st->isRunning.load())
 		{
-			if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
-			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
+			// While running, both log actions are hard-disabled.
+			EnableMany(false, { st->hCopyLogBtn, st->hSaveLogBtn });
 			return;
 		}
 
-		// Copy Log should follow the exact same enable/disable rules as Save Log.
-		const BOOL enable = g_state->logActionsArmed ? TRUE : FALSE;
-		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enable);
-		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enable);
+		// When idle, keep Copy Log behavior in lock-step with Save Log.
+		const bool enable = (st->logActionsArmed ? true : false);
+		EnableMany(enable, { st->hCopyLogBtn, st->hSaveLogBtn });
+	}
+
+	static void UpdateLogActionButtonsEnabled()
+	{
+		UpdateLogActionButtonsEnabled(g_state);
+	}
+
+	static void UpdateCheckUpdatesButtonEnabled(AppState* st)
+	{
+		if (!st || !st->hCheckUpdatesBtn) return;
+		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
+		helpers::EnableCtl(st->hCheckUpdatesBtn, enable);
 	}
 
 	static void UpdateCheckUpdatesButtonEnabled()
 	{
-		if (!g_state || !g_state->hCheckUpdatesBtn) return;
-		const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
-		EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+		UpdateCheckUpdatesButtonEnabled(g_state);
+	}
+
+	static void UpdateHelpButtonEnabled(AppState* st)
+	{
+		if (!st || !st->hHelpBtn) return;
+		const bool enable = st->logActionsArmed && !st->isRunning.load();
+		helpers::EnableCtl(st->hHelpBtn, enable);
 	}
 
 	static void UpdateHelpButtonEnabled()
 	{
-		if (!g_state || !g_state->hHelpBtn) return;
-		const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
-		EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
+		UpdateHelpButtonEnabled(g_state);
 	}
 
 
@@ -772,9 +789,21 @@ namespace helpers
 		if (h) EnableWindow(h, enabled ? TRUE : FALSE);
 	}
 
+	static void EnableMany(bool enabled, std::initializer_list<HWND> ctrls)
+	{
+		for (HWND h : ctrls)
+			EnableCtl(h, enabled);
+	}
+
 	static void ShowCtl(HWND h, bool visible)
 	{
 		if (h) ShowWindow(h, visible ? SW_SHOW : SW_HIDE);
+	}
+
+	static void ShowMany(bool visible, std::initializer_list<HWND> ctrls)
+	{
+		for (HWND h : ctrls)
+			ShowCtl(h, visible);
 	}
 
 	static void SetTextCtl(HWND h, std::wstring_view text)
@@ -790,19 +819,14 @@ namespace helpers
 		if (!st) return;
 
 		// Disable everything except Cancel while running.
-		EnableCtl(st->hBrowseBtn, !running);
-		EnableCtl(st->hRunButton, !running);
-		EnableCtl(st->hDeleteBtn, !running);
-		EnableCtl(st->hFolderEdit, !running);
+		EnableMany(!running, { st->hBrowseBtn, st->hRunButton, st->hDeleteBtn, st->hFolderEdit });
 		if (running) EnableCtl(st->hHelpBtn, false);
 
 		// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
 		// We hard-disable them here when running; when idle we defer to the existing helper logic.
 		if (running)
 		{
-			EnableCtl(st->hCopyLogBtn, false);
-			EnableCtl(st->hSaveLogBtn, false);
-			EnableCtl(st->hCheckUpdatesBtn, false);
+			EnableMany(false, { st->hCopyLogBtn, st->hSaveLogBtn, st->hCheckUpdatesBtn });
 		}
 		else
 		{
@@ -831,8 +855,7 @@ namespace helpers
 		AssertUiThread(st);
 
 		if (!st) return;
-		ShowCtl(st->hProgress, visible);
-		ShowCtl(st->hProgressText, visible);
+		ShowMany(visible, { st->hProgress, st->hProgressText });
 	}
 
 	static void SetStatusText(AppState* st, std::wstring_view text)
@@ -4467,7 +4490,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			UpdateHelpButtonEnabled();
 			// Clear then load MapPackSyncTool.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
-			SetWindowTextW(g_state->hProgressText, L"");
+			helpers::SetStatusText(st, L"Ready");
 		}
 	}
 
@@ -4524,9 +4547,9 @@ static LRESULT HandleWmClose(AppState* st, HWND hwnd)
 		{
 			st->cancelRequested.store(true);
 			st->pendingExitAfterWorker = true;
-			if (st->hCancelBtn) EnableCtl(st->hCancelBtn, false);
+			EnableMany(false, { st->hCancelBtn });
 			FreezeProgressOnCancel(st);
-			EnableCtl(st->hDeleteBtn, true);
+			EnableMany(true, { st->hDeleteBtn });
 			PostProgressTextW(L"Cancel requested... exiting when safe.");
 			Log("INFO: Window close requested during sync; canceling.\r\n");
 			return 0;
@@ -4806,7 +4829,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	SendMessageW(g_state->hProgress, PBM_SETRANGE32, 0, 1);
 	SendMessageW(g_state->hProgress, PBM_SETPOS, 0, 0);
 	g_state->hProgressText = CreateWindowExW(
-		WS_EX_CLIENTEDGE, L"STATIC", L"",
+		WS_EX_CLIENTEDGE, L"STATIC", L"Ready",
 		WS_CHILD | WS_VISIBLE,
 		10, 60, 800, 22,
 		g_state->hMainWnd, (HMENU)2002, hInst, nullptr);
