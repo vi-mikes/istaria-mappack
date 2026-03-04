@@ -730,14 +730,19 @@ namespace helpers
 	static void UpdateLogActionButtonsEnabled()
 	{
 		if (!g_state) return;
+
+		// While a worker is running, these actions must remain disabled.
 		if (g_state->isRunning.load())
 		{
 			if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
 			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
 			return;
 		}
-		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
-		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
+
+		// Copy Log should follow the exact same enable/disable rules as Save Log.
+		const BOOL enable = g_state->logActionsArmed ? TRUE : FALSE;
+		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enable);
+		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enable);
 	}
 
 	static void UpdateCheckUpdatesButtonEnabled()
