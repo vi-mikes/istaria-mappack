@@ -55,7 +55,6 @@ Notes
 #include <cstring>     // memcpy
 #include <cstdint>
 #include <functional>  // std::function
-#include <initializer_list>
 #include <memory>      // std::unique_ptr
 #include <winhttp.h>
 
@@ -263,6 +262,13 @@ struct unique_heap_wstr
 // --------------------------------------------------
 // Main window state (UI handles + worker-thread coordination)
 // --------------------------------------------------
+enum class WorkerKind
+{
+	None = 0,
+	Sync,
+	Remove,
+};
+
 struct AppState
 {
 	HWND hMainWnd = nullptr;
@@ -286,6 +292,7 @@ struct AppState
 	DWORD uiThreadId = 0;
 	std::atomic_bool isRunning{ false };
 	std::atomic_bool cancelRequested{ false };
+	WorkerKind workerKind = WorkerKind::None;
 	bool pendingExitAfterWorker = false;
 	// Track whether we currently have marquee enabled (so we can cleanly toggle style)
 	bool progressMarqueeOn = false;
@@ -566,8 +573,6 @@ namespace helpers
 	enum class UiMode;
 	static void ApplyUiMode(AppState* st, UiMode mode);
 
-	static void ResetUiToIdle(AppState* st);
-
 	static void AppendToOutputW(AppState* st, const std::wstring& s);
 	static void AppendToOutputW(const std::wstring& s);
 	static void ClearOutput(AppState* st);
@@ -709,9 +714,7 @@ namespace helpers
 	// Tiny control helpers (forward declarations)
 	// ------------------------------------------------------------
 	static void EnableCtl(HWND h, bool enabled);
-	static void EnableMany(bool enabled, std::initializer_list<HWND> ctrls);
 	static void ShowCtl(HWND h, bool visible);
-	static void ShowMany(bool visible, std::initializer_list<HWND> ctrls);
 	static void SetTextCtl(HWND h, std::wstring_view text);
 
 	static void OutputSetTextW(AppState* st, std::wstring_view text, bool scrollTop)
@@ -732,50 +735,31 @@ namespace helpers
 		UpdateLogActionButtonsEnabled();
 	}
 
-	static void UpdateLogActionButtonsEnabled(AppState* st)
-	{
-		if (!st) return;
-
-		// While a worker runs, log actions are always disabled.
-		if (st->isRunning.load())
-		{
-			// While running, both log actions are hard-disabled.
-			EnableMany(false, { st->hCopyLogBtn, st->hSaveLogBtn });
-			return;
-		}
-
-		// When idle, keep Copy Log behavior in lock-step with Save Log.
-		const bool enable = (st->logActionsArmed ? true : false);
-		EnableMany(enable, { st->hCopyLogBtn, st->hSaveLogBtn });
-	}
-
 	static void UpdateLogActionButtonsEnabled()
 	{
-		UpdateLogActionButtonsEnabled(g_state);
-	}
-
-	static void UpdateCheckUpdatesButtonEnabled(AppState* st)
-	{
-		if (!st || !st->hCheckUpdatesBtn) return;
-		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
-		helpers::EnableCtl(st->hCheckUpdatesBtn, enable);
+		if (!g_state) return;
+		if (g_state->isRunning.load())
+		{
+			if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
+			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
+			return;
+		}
+		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
+		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
 	}
 
 	static void UpdateCheckUpdatesButtonEnabled()
 	{
-		UpdateCheckUpdatesButtonEnabled(g_state);
-	}
-
-	static void UpdateHelpButtonEnabled(AppState* st)
-	{
-		if (!st || !st->hHelpBtn) return;
-		const bool enable = st->logActionsArmed && !st->isRunning.load();
-		helpers::EnableCtl(st->hHelpBtn, enable);
+		if (!g_state || !g_state->hCheckUpdatesBtn) return;
+		const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
+		EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
 	}
 
 	static void UpdateHelpButtonEnabled()
 	{
-		UpdateHelpButtonEnabled(g_state);
+		if (!g_state || !g_state->hHelpBtn) return;
+		const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
+		EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
 	}
 
 
@@ -791,28 +775,9 @@ namespace helpers
 		if (h) EnableWindow(h, enabled ? TRUE : FALSE);
 	}
 
-	static void EnableMany(bool enabled, std::initializer_list<HWND> ctrls)
-	{
-		for (HWND h : ctrls)
-			EnableCtl(h, enabled);
-	}
-
 	static void ShowCtl(HWND h, bool visible)
 	{
 		if (h) ShowWindow(h, visible ? SW_SHOW : SW_HIDE);
-	}
-
-	static void ShowMany(bool visible, std::initializer_list<HWND> ctrls)
-	{
-		for (HWND h : ctrls)
-			ShowCtl(h, visible);
-	}
-
-
-	static void SetTextMany(std::wstring_view text, std::initializer_list<HWND> ctrls)
-	{
-		for (HWND h : ctrls)
-			SetTextCtl(h, text);
 	}
 
 	static void SetTextCtl(HWND h, std::wstring_view text)
@@ -828,14 +793,19 @@ namespace helpers
 		if (!st) return;
 
 		// Disable everything except Cancel while running.
-		EnableMany(!running, { st->hBrowseBtn, st->hRunButton, st->hDeleteBtn, st->hFolderEdit });
+		EnableCtl(st->hBrowseBtn, !running);
+		EnableCtl(st->hRunButton, !running);
+		EnableCtl(st->hDeleteBtn, !running);
+		EnableCtl(st->hFolderEdit, !running);
 		if (running) EnableCtl(st->hHelpBtn, false);
 
 		// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
 		// We hard-disable them here when running; when idle we defer to the existing helper logic.
 		if (running)
 		{
-			EnableMany(false, { st->hCopyLogBtn, st->hSaveLogBtn, st->hCheckUpdatesBtn });
+			EnableCtl(st->hCopyLogBtn, false);
+			EnableCtl(st->hSaveLogBtn, false);
+			EnableCtl(st->hCheckUpdatesBtn, false);
 		}
 		else
 		{
@@ -845,7 +815,7 @@ namespace helpers
 		}
 
 		// Cancel is the inverse (only enabled while running).
-		EnableCtl(st->hCancelBtn, running);
+		EnableCtl(st->hCancelBtn, running && (st->workerKind == WorkerKind::Sync));
 	}
 
 
@@ -864,7 +834,8 @@ namespace helpers
 		AssertUiThread(st);
 
 		if (!st) return;
-		ShowMany(visible, { st->hProgress, st->hProgressText });
+		ShowCtl(st->hProgress, visible);
+		ShowCtl(st->hProgressText, visible);
 	}
 
 	static void SetStatusText(AppState* st, std::wstring_view text)
@@ -872,7 +843,7 @@ namespace helpers
 		AssertUiThread(st);
 
 		if (!st || !st->hProgressText) return;
-		SetTextMany(text, { st->hProgressText });
+		SetTextCtl(st->hProgressText, text);
 		InvalidateRect(st->hProgressText, nullptr, TRUE);
 	}
 
@@ -959,20 +930,6 @@ namespace helpers
 			break;
 		}
 	}
-
-	static void ResetUiToIdle(AppState* st)
-	{
-		AssertUiThread(st);
-		if (!st) return;
-
-		ApplyUiMode(st, UiMode::Idle);
-
-		UpdateLogActionButtonsEnabled(st);
-		UpdateCheckUpdatesButtonEnabled(st);
-		UpdateHelpButtonEnabled(st);
-	}
-
-
 
 
 	static void AppendToOutputW(const wchar_t* text)
@@ -1310,7 +1267,11 @@ static std::wstring MakeProgressFileLabel(const wchar_t* verb, size_t index1, si
 	std::wstring nameW = Utf8ToWide(name.empty() ? best : name);
 	if (nameW.empty()) nameW = L"(unknown)";
 
-	std::wstring msg = std::wstring(verb) + L" " + std::to_wstring(index1) + L"/" + std::to_wstring(total) + L": " + nameW;
+	int pct = 0;
+	if (total > 0) pct = (int)((long long)index1 * 100LL / (long long)total);
+
+	std::wstring msg = std::wstring(verb) + L" " + std::to_wstring(index1) + L"/" + std::to_wstring(total)
+		+ L" ( " + std::to_wstring(pct) + L"% ): " + nameW;
 
 	// (Intentionally showing filename only; full/relative paths can be long and get clipped.)
 	return msg;
@@ -2702,12 +2663,6 @@ static bool MoveReplace(const fs::path& from, const fs::path& to)
 	std::wstring wTo = to.wstring();
 	return MoveFileExW(wFrom.c_str(), wTo.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
-
-// Forward declarations for retry helpers (definitions are below).
-static bool ShouldRetryHttpStatus(unsigned long status);
-static bool IsTransientWinHttpError(DWORD err);
-static DWORD BackoffMsForAttempt(int attempt);
-
 static bool DownloadUrlToFileVerifySha256(
 	const std::string& url,
 	const fs::path& destFile,
@@ -2747,80 +2702,18 @@ static bool DownloadUrlToFileVerifySha256(
 	const long totalMs = AppConstants::kFileTimeoutMs;
 	std::string dlErr;
 	long code = 0;
-
-	// Retry loop: re-download to a fresh temp file + hash context on transient failures.
-	const int kMaxAttempts = 4;
-	bool ok = false;
-	for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
+	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs, &dlErr, &code);
+	if (outHttp) *outHttp = code;
+	fflush(ctx.f);
+	fclose(ctx.f);
+	ctx.f = nullptr;
+	if (!ok)
 	{
-		if (cancel.IsCanceled()) { DlCloseHash(ctx); fs::remove(tmp, ec); if (outErr) *outErr = "Canceled"; return false; }
-
-		ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs, &dlErr, &code);
-		if (outHttp) *outHttp = code;
-
-		fflush(ctx.f);
-		fclose(ctx.f);
-		ctx.f = nullptr;
-
-		if (ok) break;
-
-		// Decide whether to retry.
-		bool retry = false;
-		if (code != 0)
-		{
-			retry = ShouldRetryHttpStatus((unsigned long)code);
-		}
-		else
-		{
-			// Parse WinHTTP error code from "(####)" suffix when present.
-			DWORD gle = 0;
-			{
-				size_t r = dlErr.rfind(')');
-				size_t l = (r == std::string::npos) ? std::string::npos : dlErr.rfind('(', r);
-				if (l != std::string::npos && r != std::string::npos && r > l + 1)
-				{
-					bool allDigits = true;
-					for (size_t i = l + 1; i < r; ++i) if (dlErr[i] < '0' || dlErr[i] > '9') { allDigits = false; break; }
-					if (allDigits) gle = (DWORD)strtoul(dlErr.c_str() + l + 1, nullptr, 10);
-				}
-			}
-			retry = IsTransientWinHttpError(gle);
-		}
-
 		DlCloseHash(ctx);
 		fs::remove(tmp, ec);
-
-		if (!retry || attempt == kMaxAttempts)
-		{
-			if (outErr) *outErr = dlErr.empty() ? "Download failed" : dlErr;
-			return false;
-		}
-
-		// Backoff + fresh temp file / hash ctx for next attempt.
-		Sleep(BackoffMsForAttempt(attempt));
-
-		tmp = destFile;
-		tmp += L".tmp";
-		tmp += std::to_wstring(GetCurrentProcessId());
-		tmp += L".";
-		tmp += std::to_wstring(GetTickCount64());
-
-		ctx = DlFileHashCtx{};
-		if (!DlInitSha256(ctx))
-		{
-			if (outErr) *outErr = "BCrypt SHA-256 init failed";
-			return false;
-		}
-		_wfopen_s(&ctx.f, tmp.wstring().c_str(), L"wb");
-		if (!ctx.f)
-		{
-			DlCloseHash(ctx);
-			if (outErr) *outErr = "Failed to open temp file for writing";
-			return false;
-		}
+		if (outErr) *outErr = dlErr.empty() ? "Download failed" : dlErr;
+		return false;
 	}
-
-	// ctx.f already closed above when ok.
 	if (!ctx.ok)
 	{
 		DlCloseHash(ctx);
@@ -3564,6 +3457,7 @@ static void StartSyncIfNotRunning()
 	}
 	g_state->cancelRequested.store(false);
 	g_state->pendingExitAfterWorker = false;
+	g_state->workerKind = WorkerKind::Sync;
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
@@ -3574,7 +3468,7 @@ static void StartSyncIfNotRunning()
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		ResetUiToIdle(g_state);
+		ApplyUiMode(g_state, UiMode::Idle);
 		Log("ERROR: Failed to start worker thread.");
 	}
 }
@@ -3627,6 +3521,7 @@ static void StartRemoveIfNotRunning()
 	}
 	g_state->cancelRequested.store(false);
 	g_state->pendingExitAfterWorker = false;
+	g_state->workerKind = WorkerKind::Remove;
 	g_state->progressFrozenOnCancel = false;
 	g_state->progressTotal = 100;
 	g_state->progressPos = 0;
@@ -3637,7 +3532,7 @@ static void StartRemoveIfNotRunning()
 	if (!g_state->hWorkerThread)
 	{
 		g_state->isRunning.store(false);
-		ResetUiToIdle(g_state);
+		ApplyUiMode(g_state, UiMode::Idle);
 		Log("ERROR: Failed to start remove worker thread.");
 	}
 }
@@ -3833,7 +3728,7 @@ static bool WinHttpDownloadUrlToFile(const wchar_t* url, const fs::path& outFile
 			return false;
 		}
 		if (avail == 0) break;
-		DWORD toRead = std::min<DWORD>(avail, (DWORD)buf.size());
+		DWORD toRead = min(avail, (DWORD)buf.size());
 		DWORD read = 0;
 		if (!WinHttpReadData(hRequest, buf.data(), toRead, &read))
 		{
@@ -3858,33 +3753,62 @@ static bool WinHttpDownloadUrlToUtf8String(const wchar_t* url, std::string& out,
 	outErr.clear();
 	if (!url || !*url) { outErr = L"Empty URL"; return false; }
 
-	// Unify update/version text downloads with the manifest downloader:
-	// use the same WinHttpGetToString_NoRedirects() path + timeouts + caps.
-	const std::string urlUtf8 = WideToUtf8(url);
-	const long connectMs = AppConstants::kManifestConnectTimeoutSec * 1000L;
-	const long totalMs = AppConstants::kManifestTimeoutSec * 1000L;
+	URL_COMPONENTS uc{};
+	uc.dwStructSize = sizeof(uc);
+	uc.dwSchemeLength = (DWORD)-1;
+	uc.dwHostNameLength = (DWORD)-1;
+	uc.dwUrlPathLength = (DWORD)-1;
+	uc.dwExtraInfoLength = (DWORD)-1;
+	if (!WinHttpCrackUrl(url, 0, 0, &uc)) { outErr = L"WinHttpCrackUrl failed"; return false; }
+	if (!uc.lpszHostName || uc.dwHostNameLength == 0) { outErr = L"Invalid URL host"; return false; }
+	if (!uc.lpszUrlPath || uc.dwUrlPathLength == 0) { outErr = L"Invalid URL path"; return false; }
 
-	CancelToken cancel{}; // no cancellation for these small text downloads
-	std::string errUtf8;
-	long http = 0;
-	if (!WinHttpGetToString_NoRedirects(urlUtf8, out, cancel, connectMs, totalMs, &errUtf8, &http))
+	std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+	std::wstring path;
+	path.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
+	if (uc.lpszExtraInfo && uc.dwExtraInfoLength) path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+
+	HINTERNET hSession = WinHttpOpen(AppConstants::kUserAgentW, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hSession) { outErr = L"WinHttpOpen failed"; return false; }
+	ScopeExit closeSession{ [&]() { WinHttpCloseHandle(hSession); } };
+
+	HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), uc.nPort, 0);
+	if (!hConnect) { outErr = L"WinHttpConnect failed"; return false; }
+	ScopeExit closeConnect{ [&]() { WinHttpCloseHandle(hConnect); } };
+
+	DWORD flags = 0;
+	if (uc.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
+	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+	if (!hRequest) { outErr = L"WinHttpOpenRequest failed"; return false; }
+	ScopeExit closeRequest{ [&]() { WinHttpCloseHandle(hRequest); } };
+
+	if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { outErr = L"WinHttpSendRequest failed"; return false; }
+	if (!WinHttpReceiveResponse(hRequest, nullptr)) { outErr = L"WinHttpReceiveResponse failed"; return false; }
+
+	DWORD status = 0; DWORD statusSize = sizeof(status);
+	WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+	if (status < 200 || status >= 300)
 	{
-		// Prefer the detailed UTF-8 error if present.
-		if (!errUtf8.empty())
-			outErr = Utf8ToWide(errUtf8);
-		else if (http != 0)
-		{
-			wchar_t msg[128] = {};
-			swprintf_s(msg, L"HTTP status %ld", http);
-			outErr = msg;
-		}
-		else
-			outErr = L"Download failed";
+		wchar_t msg[128] = {};
+		swprintf_s(msg, L"HTTP status %lu", (unsigned long)status);
+		outErr = msg;
 		return false;
+	}
+
+	std::vector<char> buf(64 * 1024);
+	for (;;)
+	{
+		DWORD avail = 0;
+		if (!WinHttpQueryDataAvailable(hRequest, &avail)) { outErr = L"WinHttpQueryDataAvailable failed"; return false; }
+		if (avail == 0) break;
+		DWORD toRead = min(avail, (DWORD)buf.size());
+		DWORD read = 0;
+		if (!WinHttpReadData(hRequest, buf.data(), toRead, &read)) { outErr = L"WinHttpReadData failed"; return false; }
+		if (read == 0) break;
+		out.append(buf.data(), buf.data() + read);
 	}
 	return true;
 }
-
 
 static bool WinHttpDownloadUrlToWideString(const wchar_t* url, std::wstring& out, std::wstring& outErr)
 {
@@ -3892,142 +3816,6 @@ static bool WinHttpDownloadUrlToWideString(const wchar_t* url, std::wstring& out
 	if (!WinHttpDownloadUrlToUtf8String(url, bytes, outErr)) return false;
 	out = Utf8ToWide(bytes);
 	return true;
-}
-
-// --------------------------------------------------
-// Simple retry helpers for WinHTTP downloads (update/version/help text, update exe)
-// Conservative: retry only on common transient HTTP statuses and WinHTTP transient errors.
-// --------------------------------------------------
-static bool ShouldRetryHttpStatus(unsigned long status)
-{
-	switch (status)
-	{
-	case 408: // Request Timeout
-	case 429: // Too Many Requests
-	case 500: // Internal Server Error
-	case 502: // Bad Gateway
-	case 503: // Service Unavailable
-	case 504: // Gateway Timeout
-		return true;
-	default:
-		return false;
-	}
-}
-
-static bool IsTransientWinHttpError(DWORD err)
-{
-	// Common transient WinHTTP errors
-	switch (err)
-	{
-	case ERROR_WINHTTP_TIMEOUT:
-	case ERROR_WINHTTP_CANNOT_CONNECT:
-	case ERROR_WINHTTP_CONNECTION_ERROR:
-	case ERROR_WINHTTP_NAME_NOT_RESOLVED:
-	case ERROR_WINHTTP_RESEND_REQUEST:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static DWORD ExtractTrailingWin32ErrorCode(const std::wstring& msg)
-{
-	// Looks for a trailing "(12345)" pattern; returns 0 if not found.
-	size_t r = msg.rfind(L')');
-	size_t l = (r == std::wstring::npos) ? std::wstring::npos : msg.rfind(L'(', r);
-	if (l == std::wstring::npos || r == std::wstring::npos || r <= l + 1) return 0;
-	DWORD code = 0;
-	for (size_t i = l + 1; i < r; ++i)
-	{
-		if (msg[i] < L'0' || msg[i] > L'9') return 0;
-		code = code * 10 + (DWORD)(msg[i] - L'0');
-	}
-	return code;
-}
-
-static DWORD BackoffMsForAttempt(int attempt)
-{
-	// attempt: 1..N
-	DWORD ms = 250u;
-	for (int i = 1; i < attempt; ++i)
-		ms = std::min<DWORD>(ms * 2u, 4000u);
-	// tiny jitter (0-149ms)
-	ms += (DWORD)(GetTickCount64() % 150u);
-	return ms;
-}
-
-static bool WinHttpDownloadUrlToUtf8String_Retry(const wchar_t* url, std::string& out, std::wstring& outErr, int maxAttempts = 4)
-{
-	outErr.clear();
-	for (int attempt = 1; attempt <= maxAttempts; ++attempt)
-	{
-		std::wstring err;
-		out.clear();
-		if (WinHttpDownloadUrlToUtf8String(url, out, err))
-			return true;
-
-		// Decide whether to retry.
-		bool retry = false;
-		// HTTP status errors look like "HTTP status ###"
-		if (err.rfind(L"HTTP status ", 0) == 0)
-		{
-			unsigned long st = (unsigned long)_wtoi(err.c_str() + wcslen(L"HTTP status "));
-			retry = ShouldRetryHttpStatus(st);
-		}
-		else
-		{
-			DWORD gle = ExtractTrailingWin32ErrorCode(err);
-			retry = IsTransientWinHttpError(gle);
-		}
-
-		outErr = err;
-		if (!retry || attempt == maxAttempts)
-			return false;
-
-		Sleep(BackoffMsForAttempt(attempt));
-	}
-	return false;
-}
-
-static bool WinHttpDownloadUrlToWideString_Retry(const wchar_t* url, std::wstring& out, std::wstring& outErr, int maxAttempts = 4)
-{
-	std::string bytes;
-	if (!WinHttpDownloadUrlToUtf8String_Retry(url, bytes, outErr, maxAttempts))
-		return false;
-	out = Utf8ToWide(bytes);
-	return true;
-}
-
-static bool WinHttpDownloadUrlToFile_Retry(const wchar_t* url, const fs::path& outFile, std::wstring& outErr, int maxAttempts = 4)
-{
-	outErr.clear();
-	for (int attempt = 1; attempt <= maxAttempts; ++attempt)
-	{
-		std::wstring err;
-		if (WinHttpDownloadUrlToFile(url, outFile, err))
-			return true;
-
-		bool retry = false;
-		if (err.rfind(L"HTTP status ", 0) == 0)
-		{
-			unsigned long st = (unsigned long)_wtoi(err.c_str() + wcslen(L"HTTP status "));
-			retry = ShouldRetryHttpStatus(st);
-		}
-		else
-		{
-			DWORD gle = ExtractTrailingWin32ErrorCode(err);
-			retry = IsTransientWinHttpError(gle);
-		}
-
-		outErr = err;
-		if (!retry || attempt == maxAttempts)
-			return false;
-
-		// Best-effort cleanup of partial output before retrying.
-		(void)DeleteFileW(outFile.c_str());
-		Sleep(BackoffMsForAttempt(attempt));
-	}
-	return false;
 }
 struct UpdateResult
 {
@@ -4453,7 +4241,7 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 
 	std::wstring versionTxt;
 	std::wstring verErr;
-	if (!WinHttpDownloadUrlToWideString_Retry(kUpdateVersionUrl, versionTxt, verErr))
+	if (!WinHttpDownloadUrlToWideString(kUpdateVersionUrl, versionTxt, verErr))
 	{
 		res->err = L"Failed to download version.txt: " + verErr;
 		return 0;
@@ -4500,7 +4288,7 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	res->downloadedTemp = tempExe;
 
 	std::wstring dlErr;
-	if (!WinHttpDownloadUrlToFile_Retry(kUpdateExeUrl, tempExe, dlErr))
+	if (!WinHttpDownloadUrlToFile(kUpdateExeUrl, tempExe, dlErr))
 	{
 		res->err = L"Download failed: " + dlErr;
 		return 0;
@@ -4688,7 +4476,6 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			UpdateHelpButtonEnabled();
 			// Clear then load MapPackSyncTool.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
-			helpers::SetStatusText(st, L"Ready");
 		}
 	}
 
@@ -4745,9 +4532,9 @@ static LRESULT HandleWmClose(AppState* st, HWND hwnd)
 		{
 			st->cancelRequested.store(true);
 			st->pendingExitAfterWorker = true;
-			EnableMany(false, { st->hCancelBtn });
+			if (st->hCancelBtn) EnableCtl(st->hCancelBtn, false);
 			FreezeProgressOnCancel(st);
-			EnableMany(true, { st->hDeleteBtn });
+			EnableCtl(st->hDeleteBtn, true);
 			PostProgressTextW(L"Cancel requested... exiting when safe.");
 			Log("INFO: Window close requested during sync; canceling.\r\n");
 			return 0;
@@ -4848,7 +4635,8 @@ static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
 	case UiEventKind::WorkerDone:
 		if (st2)
 		{
-			ResetUiToIdle(st2);
+			st2->workerKind = WorkerKind::None;
+			ApplyUiMode(st2, UiMode::Idle);
 			if (st2->hWorkerThread) { CloseHandle(st2->hWorkerThread); st2->hWorkerThread = nullptr; }
 			if (st2->pendingExitAfterWorker) { DestroyWindow(hwnd); }
 		}
@@ -4986,7 +4774,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		690, 12, 60, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hCancelBtn = CreateWindowW(
-		L"BUTTON", L"Cancel Action",
+		L"BUTTON", L"Cancel Sync",
 		WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
 		755, 12, 60, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
