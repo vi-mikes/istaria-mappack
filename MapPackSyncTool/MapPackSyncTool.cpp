@@ -1079,7 +1079,7 @@ namespace helpers
 			ClearOutput();
 
 		fs::path exePath = GetThisExePath();
-		fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
+		fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool_Help.txt") : (exePath.parent_path() / L"MapPackSyncTool_Help.txt");
 
 		std::wstring textW;
 		std::wstring err;
@@ -4914,7 +4914,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		{
 			st->logActionsArmed = false;
 			UpdateHelpButtonEnabled();
-			// Clear then load MapPackSyncTool.txt into the log.
+			// Clear then load MapPackSyncTool_Help.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
 		}
 	}
@@ -5274,7 +5274,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	UpdateLogActionButtonsEnabled();
 	UpdateHelpButtonEnabled();
-	// On startup, load MapPackSyncTool.txt (if present) into the log.
+	// On startup, load MapPackSyncTool_Help.txt (if present) into the log.
 	LoadHelpTextIntoOutput(true, false);
 	// --------------------------------------------------
 	// Tooltips
