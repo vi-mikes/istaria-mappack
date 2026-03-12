@@ -327,6 +327,11 @@ static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out
 static const wchar_t* kSettingsIniName = L"MapPackSyncTool.ini";
 static const wchar_t* kIniSectionSettings = L"Settings";
 static const wchar_t* kIniKeyLastFolder = L"LastFolder";
+static const wchar_t* kIniSectionLicense = L"License";
+static const wchar_t* kIniKeyTermsAccepted = L"TermsAccepted";
+static const wchar_t* kIniKeyTermsVersion = L"TermsVersion";
+static constexpr int kCurrentTermsVersion = 1;
+static const wchar_t* kTermsFileName = L"MapPackSyncTool_Terms.txt";
 
 static std::wstring GetSettingsIniPath()
 {
@@ -364,6 +369,28 @@ static void IniWriteLastFolder(const std::wstring& folder)
 	const std::wstring iniPath = GetSettingsIniPath();
 	// This creates the INI if it doesn't exist yet.
 	WritePrivateProfileStringW(kIniSectionSettings, kIniKeyLastFolder, v.c_str(), iniPath.c_str());
+}
+
+static int IniReadAcceptedTermsVersion()
+{
+	const std::wstring iniPath = GetSettingsIniPath();
+	const UINT accepted = GetPrivateProfileIntW(kIniSectionLicense, kIniKeyTermsAccepted, 0, iniPath.c_str());
+	if (accepted == 0)
+		return 0;
+	return (int)GetPrivateProfileIntW(kIniSectionLicense, kIniKeyTermsVersion, 0, iniPath.c_str());
+}
+
+static bool HasAcceptedCurrentTerms()
+{
+	return IniReadAcceptedTermsVersion() >= kCurrentTermsVersion;
+}
+
+static void IniWriteAcceptedTermsVersion(int version)
+{
+	const std::wstring iniPath = GetSettingsIniPath();
+	const std::wstring versionW = std::to_wstring(version);
+	WritePrivateProfileStringW(kIniSectionLicense, kIniKeyTermsAccepted, L"1", iniPath.c_str());
+	WritePrivateProfileStringW(kIniSectionLicense, kIniKeyTermsVersion, versionW.c_str(), iniPath.c_str());
 }
 
 
@@ -582,6 +609,7 @@ namespace helpers
 	static void AppendToOutputW(const std::wstring& s);
 	static void ClearOutput(AppState* st);
 	static void ClearOutput();
+	static bool ReadUtf8TextFileStrict(const fs::path& path, std::wstring& textW, std::wstring* outErr);
 	static void LoadHelpTextIntoOutput(AppState* st);
 	static void LoadHelpTextIntoOutput();
 	static void CopyOutputToClipboard(AppState* st);
@@ -962,28 +990,42 @@ namespace helpers
 	{
 		ClearOutput(g_state);
 	}
-	// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
-	// - If clearFirst is true, the output is cleared before loading.
-	// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
-	static bool LoadHelpTextIntoOutput(AppState* st, bool clearFirst, bool showErrorBox)
+	static std::wstring NormalizeToWindowsNewlines(const std::wstring& s)
 	{
-		if (!st || !st->hOutput)
-			return false;
+		std::wstring out;
+		out.reserve(s.size() + 32);
 
-		if (clearFirst)
-			ClearOutput();
+		for (size_t i = 0; i < s.size(); ++i)
+		{
+			const wchar_t ch = s[i];
 
-		fs::path exePath = GetThisExePath();
-		fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
+			if (ch == L'\r')
+			{
+				out += L"\r\n";
+				if (i + 1 < s.size() && s[i + 1] == L'\n')
+					++i;
+			}
+			else if (ch == L'\n')
+			{
+				out += L"\r\n";
+			}
+			else
+			{
+				out.push_back(ch);
+			}
+		}
 
-		std::ifstream in(txtPath, std::ios::binary);
+		return out;
+	}
+	static bool ReadUtf8TextFileStrict(const fs::path& path, std::wstring& textW, std::wstring* outErr)
+	{
+		textW.clear();
+		if (outErr) outErr->clear();
+
+		std::ifstream in(path, std::ios::binary);
 		if (!in)
 		{
-			if (showErrorBox)
-			{
-				std::wstring msg = L"Could not open:\r\n\r\n" + txtPath.wstring();
-				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-			}
+			if (outErr) *outErr = L"Could not open:\r\n\r\n" + path.wstring();
 			return false;
 		}
 
@@ -998,16 +1040,11 @@ namespace helpers
 
 		if (!in.good() && !in.eof())
 		{
-			const std::wstring msg = L"[Help] Could not read MapPackSyncTool.txt\r\n";
-			if (showErrorBox)
-				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
-			else
-				AppendToOutputW(st, msg);
+			if (outErr) *outErr = L"Could not read:\r\n\r\n" + path.wstring();
 			return false;
 		}
 
 		size_t start = 0;
-		std::wstring textW;
 		const unsigned char* b = reinterpret_cast<const unsigned char*>(bytes.data());
 		const size_t n = bytes.size();
 
@@ -1017,31 +1054,46 @@ namespace helpers
 		}
 		else if (n >= 2 && ((b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF)))
 		{
-			const std::wstring msg =
-				L"[Help] MapPackSyncTool.txt uses an unsupported encoding.\r\n"
-				L"Please save the file as UTF-8.\r\n";
-			if (showErrorBox)
-				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
-			else
-				AppendToOutputW(st, msg);
+			if (outErr) *outErr = L"Unsupported text encoding in:\r\n\r\n" + path.wstring() + L"\r\n\r\nPlease save the file as UTF-8.";
 			return false;
 		}
 
 		if (!TryUtf8ToWideStrict(bytes.data() + start, bytes.size() - start, textW))
 		{
-			const std::wstring msg =
-				L"[Help] MapPackSyncTool.txt is not valid UTF-8.\r\n"
-				L"Please save the file as UTF-8.\r\n";
+			if (outErr) *outErr = L"Invalid UTF-8 in:\r\n\r\n" + path.wstring() + L"\r\n\r\nPlease save the file as UTF-8.";
+			return false;
+		}
+
+		return true;
+	}
+
+	// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
+	// - If clearFirst is true, the output is cleared before loading.
+	// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
+	static bool LoadHelpTextIntoOutput(AppState* st, bool clearFirst, bool showErrorBox)
+	{
+		if (!st || !st->hOutput)
+			return false;
+
+		if (clearFirst)
+			ClearOutput();
+
+		fs::path exePath = GetThisExePath();
+		fs::path txtPath = exePath.empty() ? fs::path(L"MapPackSyncTool.txt") : (exePath.parent_path() / L"MapPackSyncTool.txt");
+
+		std::wstring textW;
+		std::wstring err;
+		if (!ReadUtf8TextFileStrict(txtPath, textW, &err))
+		{
 			if (showErrorBox)
-				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
-			else
-				AppendToOutputW(st, msg);
+				MessageBoxW(st->hMainWnd, err.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 			return false;
 		}
 
 		OutputSetTextW(st, textW, true);
 		return true;
 	}
+
 
 	static bool LoadHelpTextIntoOutput(bool clearFirst, bool showErrorBox)
 	{
@@ -4523,6 +4575,234 @@ static void StartCheckForUpdates()
 // --------------------------------------------------
 
 
+
+#define IDC_LICENSE_TEXT   5101
+#define IDC_LICENSE_ACCEPT 5102
+#define IDC_LICENSE_DENY   5103
+
+struct TermsDialogState
+{
+	HWND hEdit = nullptr;
+	HWND hAccept = nullptr;
+	HWND hDeny = nullptr;
+	HFONT hFont = nullptr;
+	bool accepted = false;
+	std::wstring text;
+};
+
+static void LayoutTermsDialog(HWND hwnd, TermsDialogState* st)
+{
+	if (!st) return;
+
+	RECT rc{};
+	GetClientRect(hwnd, &rc);
+	const int m = 10;
+	const int btnW = 100;
+	const int btnH = 26;
+	const int gap = 8;
+	const int textTop = 10;
+	const int textBottomGap = 12;
+	const int buttonY = (rc.bottom - m - btnH);
+	const int textH = buttonY - textTop - textBottomGap;
+	const int denyX = rc.right - m - btnW;
+	const int acceptX = denyX - gap - btnW;
+
+	if (st->hEdit)
+		MoveWindow(st->hEdit, m, textTop, rc.right - (m * 2), textH > 40 ? textH : 40, TRUE);
+	if (st->hAccept)
+		MoveWindow(st->hAccept, acceptX, buttonY, btnW, btnH, TRUE);
+	if (st->hDeny)
+		MoveWindow(st->hDeny, denyX, buttonY, btnW, btnH, TRUE);
+}
+
+static LRESULT CALLBACK TermsDialogWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	TermsDialogState* st = (TermsDialogState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+	switch (msg)
+	{
+	case WM_NCCREATE:
+	{
+		const CREATESTRUCTW* cs = (const CREATESTRUCTW*)lParam;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+		return TRUE;
+	}
+	case WM_CREATE:
+	{
+		st = (TermsDialogState*)((LPCREATESTRUCTW)lParam)->lpCreateParams;
+		if (!st) return -1;
+
+		st->hEdit = CreateWindowExW(
+			WS_EX_CLIENTEDGE, L"EDIT", st->text.c_str(),
+			WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+			0, 0, 0, 0, hwnd, (HMENU)IDC_LICENSE_TEXT, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+
+		st->hAccept = CreateWindowW(
+			L"BUTTON", L"Accept",
+			WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+			0, 0, 0, 0, hwnd, (HMENU)IDC_LICENSE_ACCEPT, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+
+		st->hDeny = CreateWindowW(
+			L"BUTTON", L"Deny",
+			WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			0, 0, 0, 0, hwnd, (HMENU)IDC_LICENSE_DENY, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+
+		NONCLIENTMETRICSW ncm{};
+		ncm.cbSize = sizeof(ncm);
+		if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+		{
+			st->hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+			if (st->hFont)
+			{
+				SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->hFont, TRUE);
+				SendMessageW(st->hAccept, WM_SETFONT, (WPARAM)st->hFont, TRUE);
+				SendMessageW(st->hDeny, WM_SETFONT, (WPARAM)st->hFont, TRUE);
+			}
+		}
+
+		SendMessageW(st->hEdit, EM_SETSEL, 0, 0);
+		SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
+		LayoutTermsDialog(hwnd, st);
+		return 0;
+	}
+	case WM_SIZE:
+		LayoutTermsDialog(hwnd, st);
+		return 0;
+	case WM_COMMAND:
+		switch (LOWORD(wParam))
+		{
+		case IDC_LICENSE_ACCEPT:
+			if (st) st->accepted = true;
+			DestroyWindow(hwnd);
+			return 0;
+		case IDC_LICENSE_DENY:
+			if (st) st->accepted = false;
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		break;
+	case WM_CLOSE:
+		if (st) st->accepted = false;
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_DESTROY:
+		if (st && st->hFont)
+		{
+			DeleteObject(st->hFont);
+			st->hFont = nullptr;
+		}
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowTermsDialog(HWND parent, const std::wstring& termsText)
+{
+	HINSTANCE hInst = (HINSTANCE)GetModuleHandleW(nullptr);
+	static bool classRegistered = false;
+	if (!classRegistered)
+	{
+		WNDCLASSEXW wc{};
+		wc.cbSize = sizeof(wc);
+		wc.lpfnWndProc = TermsDialogWndProc;
+		wc.hInstance = hInst;
+		wc.lpszClassName = L"MapPackSyncToolTermsDialog";
+		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+		wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+		wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_MAPPACKSYNCTOOL),
+			IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+		wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_SMALL),
+			IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+		if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+			return false;
+		classRegistered = true;
+	}
+
+	TermsDialogState state{};
+	state.text = termsText;
+
+	const DWORD style = WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_CLIPCHILDREN;
+	const DWORD exStyle = WS_EX_DLGMODALFRAME;
+	int winW = 760;
+	int winH = 620;
+	int screenW = GetSystemMetrics(SM_CXSCREEN);
+	int screenH = GetSystemMetrics(SM_CYSCREEN);
+	int winX = (screenW > winW) ? ((screenW - winW) / 2) : CW_USEDEFAULT;
+	int winY = (screenH > winH) ? ((screenH - winH) / 2) : CW_USEDEFAULT;
+
+	HWND hwnd = CreateWindowExW(
+		exStyle,
+		L"MapPackSyncToolTermsDialog",
+		L"MapPack Sync Tool - Terms of Use",
+		style,
+		winX, winY, winW, winH,
+		parent, nullptr, hInst, &state);
+	if (!hwnd)
+		return false;
+
+	if (parent)
+		EnableWindow(parent, FALSE);
+
+	ShowWindow(hwnd, SW_SHOW);
+	UpdateWindow(hwnd);
+
+	MSG msg{};
+	while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+	{
+		if (!IsDialogMessageW(hwnd, &msg))
+		{
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+
+	if (parent && IsWindow(parent))
+	{
+		EnableWindow(parent, TRUE);
+		SetActiveWindow(parent);
+		SetForegroundWindow(parent);
+	}
+
+	return state.accepted;
+}
+
+static bool EnsureTermsAccepted(HWND parent)
+{
+	if (HasAcceptedCurrentTerms())
+		return true;
+
+	fs::path exePath = GetThisExePath();
+	fs::path termsPath = exePath.empty() ? fs::path(kTermsFileName) : (exePath.parent_path() / kTermsFileName);
+
+	std::wstring termsText;
+	std::wstring err;
+	if (!ReadUtf8TextFileStrict(termsPath, termsText, &err))
+	{
+		std::wstring msg =
+			L"The Terms file is missing or could not be read.\r\n\r\n" +
+			err +
+			L"\r\n\r\nThe program will now exit.";
+		MessageBoxW(parent, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	termsText = NormalizeToWindowsNewlines(termsText);
+
+	const bool accepted = ShowTermsDialog(parent, termsText);
+	if (!accepted)
+	{
+		MessageBoxW(
+			parent,
+			L"You must accept the Terms of Use to run MapPack Sync Tool.\r\n\r\nThe program will now exit.",
+			L"MapPack Sync Tool",
+			MB_OK | MB_ICONINFORMATION);
+		return false;
+	}
+
+	IniWriteAcceptedTermsVersion(kCurrentTermsVersion);
+	return true;
+}
+
 // ---- WndProc message handlers (refactor for readability) ----
 static LRESULT HandleWmSize(HWND hwnd, WPARAM wParam, LPARAM lParam)
 {
@@ -4899,6 +5179,12 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	SendMessageW(g_state->hMainWnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIconSm);
 	ShowWindow(g_state->hMainWnd, SW_SHOW);
 	UpdateWindow(g_state->hMainWnd);
+	if (!EnsureTermsAccepted(g_state->hMainWnd))
+	{
+		DestroyWindow(g_state->hMainWnd);
+		ReleaseSingleInstanceMutex();
+		return 0;
+	}
 	g_state->hFolderLabel = CreateWindowW(L"STATIC", L"Istaria Root Game Folder:", WS_CHILD | WS_VISIBLE,
 		10, 15, 170, 20, g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hFolderEdit = CreateWindowW(
