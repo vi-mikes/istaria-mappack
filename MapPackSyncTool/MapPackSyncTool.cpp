@@ -2902,7 +2902,7 @@ static void EnsureClientPrefsMapPath(const SyncConfig& cfg, const CancelToken& c
 static void EnsureClientPrefsMapPath_Remove(const SyncConfig& cfg, const CancelToken& cancel)
 {
 	// Remove mode: restore mapPath to the built-in (non-override) mappack path.
-	UpdateClientPrefsMapPath(cfg, cancel, "resources/mappack/resources/interface/maps", "Verify/Set to Normal/Vanilla Install Path");
+	UpdateClientPrefsMapPath(cfg, cancel, "resources/interface/maps", "Verify/Set to Normal/Vanilla Install Path");
 }
 
 // --------------------------------------------------
