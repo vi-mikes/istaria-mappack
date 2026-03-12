@@ -1,0 +1,41 @@
+MAP PACK SYNC TOOL
+Terms of Use
+Last Updated: March 12, 2026
+
+IMPORTANT: PLEASE READ THESE TERMS BEFORE USING THIS SOFTWARE.
+
+By clicking "Accept" or otherwise using Map Pack Sync Tool (the "Software"), you agree to these Terms of Use. If you do not agree, click "Deny" and do not use the Software.
+
+1. Purpose of the Software
+Map Pack Sync Tool is a portable utility intended to download, update, remove, and manage map pack related files for the game Istaria.
+
+2. License Grant
+You are granted a personal, non-exclusive, non-transferable, revocable license to use the Software in executable form.
+
+3. No Warranty
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+4. Limitation of Liability
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHOR SHALL NOT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES, INCLUDING BUT NOT LIMITED TO LOSS OF DATA, FILE CORRUPTION, SYSTEM INSTABILITY, LOSS OF USE, BUSINESS INTERRUPTION, OR OTHER LOSSES ARISING OUT OF OR RELATED TO THE USE OF, OR INABILITY TO USE, THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+5. User Responsibility
+You are solely responsible for:
+- Verifying that you selected the correct Istaria folder.
+- Backing up your files before using the Software.
+- Confirming compatibility with your system and game installation.
+- Reviewing any changes made by the Software.
+
+6. Network Activity
+The Software may connect to remote servers to check versions, download manifests, and transfer map pack files. By using the Software, you consent to this network activity.
+
+7. Third-Party Environment
+The Software may interact with files used by Istaria or related content. The author is not responsible for third-party software, services, servers, or content.
+
+8. Changes to These Terms
+These Terms of Use may be updated in future versions of the Software. If the terms change, you may be asked to accept the updated version before continuing to use the Software.
+
+9. Termination
+If you do not accept these Terms of Use, your license to use the Software does not begin. If you violate these Terms of Use, your permission to use the Software ends immediately.
+
+10. Acceptance
+If you click "Deny," the Software will close and will not continue to run.
