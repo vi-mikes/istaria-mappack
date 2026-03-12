@@ -171,6 +171,10 @@ static constexpr const char* kManifestPath = "/mappack_manifest.json";
 static constexpr const char* kManifestOldPath = "/mappack_manifest_old.json";
 static constexpr const wchar_t* kUpdateExeUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/MapPackSyncTool.exe";
 static constexpr const wchar_t* kUpdateVersionUrl = L"https://istaria-mappack.s3.us-west-2.amazonaws.com/version.txt";
+static constexpr const wchar_t* kMainExeFileName = L"MapPackSyncTool.exe";
+static constexpr const wchar_t* kDownloadedUpdateFileName = L"MapPackSyncTool.exe.download";
+static constexpr const wchar_t* kUpdaterExeFileName = L"MapPackSyncTool_Updater.exe";
+static constexpr const wchar_t* kLegacyUpdaterExeFileName = L"MapPackSyncTool_UpdateHelper.exe";
 
 // --------------------------------------------------
 // Global UI layout (initial size + margins)
@@ -3638,14 +3642,86 @@ static fs::path GetThisExePath()
 	return fs::path(buf);
 }
 
+static bool IsAllowedUpdaterExeName(const std::wstring& name)
+{
+	return _wcsicmp(name.c_str(), kUpdaterExeFileName) == 0 ||
+		_wcsicmp(name.c_str(), kLegacyUpdaterExeFileName) == 0;
+}
+
+static fs::path CanonicalPathForCompare(const fs::path& p)
+{
+	std::error_code ec;
+	fs::path q = fs::weakly_canonical(p, ec);
+	if (!ec && !q.empty())
+		return q;
+	q = fs::absolute(p, ec);
+	if (!ec && !q.empty())
+		return q.lexically_normal();
+	return p.lexically_normal();
+}
+
+static bool BuildApprovedUpdatePaths(const fs::path& helperExePath, fs::path& outDownloaded, fs::path& outTarget, std::wstring& outErr)
+{
+	outDownloaded.clear();
+	outTarget.clear();
+	outErr.clear();
+
+	if (helperExePath.empty())
+	{
+		outErr = L"Updater executable path is empty.";
+		return false;
+	}
+
+	const fs::path helperCanon = CanonicalPathForCompare(helperExePath);
+	const std::wstring helperName = helperCanon.filename().wstring();
+	if (!IsAllowedUpdaterExeName(helperName))
+	{
+		outErr = L"Updater executable name is not approved.";
+		return false;
+	}
+
+	const fs::path workDir = helperCanon.parent_path();
+	if (workDir.empty())
+	{
+		outErr = L"Updater working directory is invalid.";
+		return false;
+	}
+
+	outDownloaded = CanonicalPathForCompare(workDir / kDownloadedUpdateFileName);
+	outTarget = CanonicalPathForCompare(workDir / kMainExeFileName);
+
+	if (_wcsicmp(outDownloaded.filename().c_str(), kDownloadedUpdateFileName) != 0)
+	{
+		outErr = L"Approved downloaded update filename mismatch.";
+		return false;
+	}
+	if (_wcsicmp(outTarget.filename().c_str(), kMainExeFileName) != 0)
+	{
+		outErr = L"Approved target filename mismatch.";
+		return false;
+	}
+	if (CanonicalPathForCompare(outDownloaded.parent_path()) != workDir || CanonicalPathForCompare(outTarget.parent_path()) != workDir)
+	{
+		outErr = L"Updater paths are outside the approved application directory.";
+		return false;
+	}
+	if (outDownloaded == outTarget)
+	{
+		outErr = L"Downloaded update and target executable resolve to the same path.";
+		return false;
+	}
+
+	return true;
+}
+
 static void TryDeleteUpdaterExeBestEffort(const fs::path& exeDir)
 {
 	// The updater cannot delete itself while running. Best-effort cleanup is performed
 	// by the main app on startup after an update/relaunch.
 	const fs::path candidates[] = {
-		exeDir / L"MapPackSyncTool_Updater.exe",
+		exeDir / kUpdaterExeFileName,
 		// Legacy name (in case an older build left it behind).
-		exeDir / L"MapPackSyncTool_UpdateHelper.exe"
+		exeDir / kLegacyUpdaterExeFileName
 	};
 
 	for (const auto& p : candidates)
@@ -3894,11 +3970,24 @@ struct UpdateResult
 
 static int RunUpdateHelperMode(int argc, wchar_t** argv)
 {
-	// args: --apply-update <pid> <downloaded_exe> <target_exe>
-	if (argc < 5) return 2;
+	// args: --apply-update <pid>
+	if (argc < 3) return 2;
 	DWORD pid = (DWORD)_wtoi(argv[2]);
-	fs::path downloaded = argv[3];
-	fs::path target = argv[4];
+
+	std::wstring pathErr;
+	fs::path helperExe = GetThisExePath();
+	fs::path downloaded;
+	fs::path target;
+	if (!BuildApprovedUpdatePaths(helperExe, downloaded, target, pathErr))
+		return 10;
+
+	std::error_code ec;
+	if (!fs::exists(downloaded, ec) || ec)
+		return 11;
+	if (_wcsicmp(target.filename().c_str(), kMainExeFileName) != 0)
+		return 12;
+	if (!target.has_parent_path() || CanonicalPathForCompare(target.parent_path()) != CanonicalPathForCompare(helperExe.parent_path()))
+		return 13;
 
 	HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, pid);
 	if (hProc)
@@ -3907,16 +3996,13 @@ static int RunUpdateHelperMode(int argc, wchar_t** argv)
 		CloseHandle(hProc);
 	}
 
-	if (!MoveFileExW(downloaded.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING))
+	if (!MoveFileExW(downloaded.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
 	{
-		// Best-effort cleanup: do not leave the downloaded temp exe behind if applying the update fails.
 		(void)DeleteFileW(downloaded.c_str());
 		return 3;
 	}
 
-	// Ensure the updated exe will resolve side-by-side DLLs from its folder.
 	SetDllDirectoryW(target.parent_path().c_str());
-
 	ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, target.parent_path().c_str(), SW_SHOWNORMAL);
 	return 0;
 }
@@ -3925,22 +4011,32 @@ static bool LaunchUpdateHelperAndExitCurrent(const fs::path& downloadedExe)
 {
 	fs::path curExe = GetThisExePath();
 	if (curExe.empty()) return false;
-	fs::path workDir = curExe.parent_path();
-	fs::path helper = workDir / L"MapPackSyncTool_Updater.exe";
-	CopyFileW(curExe.c_str(), helper.c_str(), FALSE);
+	const fs::path curExeCanon = CanonicalPathForCompare(curExe);
+	if (_wcsicmp(curExeCanon.filename().c_str(), kMainExeFileName) != 0)
+		return false;
+
+	fs::path workDir = curExeCanon.parent_path();
+	fs::path helper = workDir / kUpdaterExeFileName;
+	fs::path approvedDownloaded;
+	fs::path approvedTarget;
+	std::wstring pathErr;
+	if (!BuildApprovedUpdatePaths(helper, approvedDownloaded, approvedTarget, pathErr))
+		return false;
+	if (CanonicalPathForCompare(downloadedExe) != approvedDownloaded)
+		return false;
+	if (approvedTarget != curExeCanon)
+		return false;
+
+	if (!CopyFileW(curExeCanon.c_str(), helper.c_str(), FALSE))
+		return false;
 
 	DWORD pid = GetCurrentProcessId();
 	std::wstring cmd;
-	cmd.reserve(1024);
+	cmd.reserve(256);
 	cmd.append(L"\"");
 	cmd.append(helper.wstring());
 	cmd.append(L"\" --apply-update ");
 	cmd.append(std::to_wstring(pid));
-	cmd.append(L" \"");
-	cmd.append(downloadedExe.wstring());
-	cmd.append(L"\" \"");
-	cmd.append(curExe.wstring());
-	cmd.append(L"\"");
 
 	STARTUPINFOW si{}; si.cb = sizeof(si);
 	PROCESS_INFORMATION pi{};
@@ -4348,7 +4444,7 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	res->different = true;
 
 	// New version available: download the updated exe to a temp file in the SAME directory as the exe so any relaunch uses the same dependency neighborhood.
-	fs::path tempExe = curExe.parent_path() / L"MapPackSyncTool.exe.download";
+	fs::path tempExe = curExe.parent_path() / kDownloadedUpdateFileName;
 	res->downloadedTemp = tempExe;
 
 	std::wstring dlErr;
