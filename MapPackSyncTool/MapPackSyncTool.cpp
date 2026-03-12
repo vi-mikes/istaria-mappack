@@ -314,6 +314,7 @@ static fs::path GetThisExePath();
 static void TrimInPlace(std::wstring& s);
 static void StripSurroundingQuotes(std::wstring& s);
 static std::wstring Utf8ToWide(const std::string& s);
+static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out);
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -932,10 +933,21 @@ namespace helpers
 	}
 
 
+	static void AppendToOutputW(AppState* st, const std::wstring& s)
+	{
+		if (s.empty()) return;
+		OutputAppendTextW(st, s);
+	}
+
+	static void AppendToOutputW(const std::wstring& s)
+	{
+		AppendToOutputW(g_state, s);
+	}
+
 	static void AppendToOutputW(const wchar_t* text)
 	{
 		if (!text) return;
-		OutputAppendTextW(g_state, text);
+		AppendToOutputW(g_state, std::wstring(text));
 	}
 
 	static void ClearOutput(AppState* st)
@@ -980,21 +992,47 @@ namespace helpers
 		if (!bytes.empty())
 			in.read(bytes.data(), (std::streamsize)bytes.size());
 
-		std::wstring textW;
-		const unsigned char* b = (const unsigned char*)bytes.data();
-		const size_t n = bytes.size();
-		if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE)
+		if (!in.good() && !in.eof())
 		{
-			// UTF-16 LE BOM
-			const size_t wcharCount = (n - 2) / 2;
-			textW.assign((const wchar_t*)(b + 2), (const wchar_t*)(b + 2) + wcharCount);
+			const std::wstring msg = L"[Help] Could not read MapPackSyncTool.txt\r\n";
+			if (showErrorBox)
+				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
+			else
+				AppendToOutputW(st, msg);
+			return false;
 		}
-		else
+
+		size_t start = 0;
+		std::wstring textW;
+		const unsigned char* b = reinterpret_cast<const unsigned char*>(bytes.data());
+		const size_t n = bytes.size();
+
+		if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
 		{
-			size_t start = 0;
-			if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
-				start = 3; // UTF-8 BOM
-			textW = Utf8ToWide(bytes.substr(start));
+			start = 3;
+		}
+		else if (n >= 2 && ((b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF)))
+		{
+			const std::wstring msg =
+				L"[Help] MapPackSyncTool.txt uses an unsupported encoding.\r\n"
+				L"Please save the file as UTF-8.\r\n";
+			if (showErrorBox)
+				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
+			else
+				AppendToOutputW(st, msg);
+			return false;
+		}
+
+		if (!TryUtf8ToWideStrict(bytes.data() + start, bytes.size() - start, textW))
+		{
+			const std::wstring msg =
+				L"[Help] MapPackSyncTool.txt is not valid UTF-8.\r\n"
+				L"Please save the file as UTF-8.\r\n";
+			if (showErrorBox)
+				MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_ICONERROR);
+			else
+				AppendToOutputW(st, msg);
+			return false;
 		}
 
 		OutputSetTextW(st, textW, true);
@@ -1189,6 +1227,32 @@ static std::wstring Utf8ToWide(const std::string& s)
 	std::wstring out((size_t)needed, L'\0');
 	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), needed);
 	return out;
+}
+
+static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out)
+{
+	out.clear();
+	if (!data && size != 0)
+		return false;
+	if (size == 0)
+		return true;
+	if (size > static_cast<size_t>(INT_MAX))
+		return false;
+
+	const int srcLen = static_cast<int>(size);
+	const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, srcLen, nullptr, 0);
+	if (needed <= 0)
+		return false;
+
+	out.resize(static_cast<size_t>(needed));
+	const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, srcLen, out.data(), needed);
+	if (written != needed)
+	{
+		out.clear();
+		return false;
+	}
+
+	return true;
 }
 static std::string WideToUtf8(const std::wstring& ws)
 {
