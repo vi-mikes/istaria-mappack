@@ -313,12 +313,24 @@ static HANDLE g_hSingleInstanceMutex = nullptr;
 // Remember the last directory used by the Save Log dialog.
 static std::wstring g_lastSaveDir;
 
+enum class PendingAutoAction
+{
+	None = 0,
+	Sync,
+	Remove,
+};
+
+static PendingAutoAction g_pendingAutoAction = PendingAutoAction::None;
+static std::wstring g_pendingAutoFolder;
+
 // Forward declarations used before their definitions.
 static fs::path GetThisExePath();
 static void TrimInPlace(std::wstring& s);
 static void StripSurroundingQuotes(std::wstring& s);
 static std::wstring Utf8ToWide(const std::string& s);
 static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out);
+static bool RelaunchSelfElevated(HWND owner, const std::wstring& parameters);
+static bool IsCurrentProcessElevated();
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -346,6 +358,158 @@ static std::wstring GetSettingsIniPath()
 	return iniPath.wstring();
 }
 
+static std::wstring Win32ErrorMessage(DWORD err)
+{
+	if (err == 0)
+		return L"Unknown error";
+	LPWSTR buf = nullptr;
+	const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+	DWORD n = FormatMessageW(flags, nullptr, err, 0, (LPWSTR)&buf, 0, nullptr);
+	std::wstring msg = (n && buf) ? std::wstring(buf, n) : (L"Win32 error " + std::to_wstring(err));
+	if (buf) LocalFree(buf);
+	while (!msg.empty() && (msg.back() == L'\r' || msg.back() == L'\n' || msg.back() == L' ' || msg.back() == L'\t'))
+		msg.pop_back();
+	return msg;
+}
+
+static bool IsLikelyAccessDeniedError(DWORD err)
+{
+	return err == ERROR_ACCESS_DENIED || err == ERROR_WRITE_PROTECT || err == ERROR_SHARING_VIOLATION;
+}
+
+static bool IsCurrentProcessElevated()
+{
+	HANDLE hToken = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+		return false;
+	unique_handle token(hToken);
+	TOKEN_ELEVATION elev{};
+	DWORD cb = 0;
+	if (!GetTokenInformation(token.get(), TokenElevation, &elev, sizeof(elev), &cb))
+		return false;
+	return elev.TokenIsElevated != 0;
+}
+
+static std::wstring QuoteCommandLineArg(const std::wstring& arg)
+{
+	std::wstring out;
+	out.push_back(L'"');
+	for (wchar_t ch : arg)
+	{
+		if (ch == L'"')
+			out += L"\\\"";
+		else
+			out.push_back(ch);
+	}
+	out.push_back(L'"');
+	return out;
+}
+
+static bool RelaunchSelfElevated(HWND owner, const std::wstring& parameters)
+{
+	fs::path exePath = GetThisExePath();
+	if (exePath.empty())
+		return false;
+	HINSTANCE rc = ShellExecuteW(
+		owner,
+		L"runas",
+		exePath.c_str(),
+		parameters.empty() ? nullptr : parameters.c_str(),
+		exePath.parent_path().c_str(),
+		SW_SHOWNORMAL);
+	return reinterpret_cast<INT_PTR>(rc) > 32;
+}
+
+static bool CanCreateAndDeleteTempFileInDirectory(const fs::path& dir, std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+	std::error_code ec;
+	if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
+	{
+		if (outErr) *outErr = L"Directory does not exist: " + dir.wstring();
+		return false;
+	}
+
+	const DWORD pid = GetCurrentProcessId();
+	const DWORD tick = GetTickCount();
+	fs::path probe = dir / (L"mpsync_write_test_" + std::to_wstring(pid) + L"_" + std::to_wstring(tick) + L".tmp");
+	HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+	if (h == INVALID_HANDLE_VALUE)
+	{
+		DWORD err = GetLastError();
+		if (outErr) *outErr = L"Cannot write in '" + dir.wstring() + L"': " + Win32ErrorMessage(err);
+		return false;
+	}
+	const char marker[] = "ok";
+	DWORD written = 0;
+	BOOL ok = WriteFile(h, marker, (DWORD)(sizeof(marker) - 1), &written, nullptr);
+	DWORD writeErr = ok ? 0 : GetLastError();
+	CloseHandle(h);
+	if (!ok)
+	{
+		if (outErr) *outErr = L"Cannot write in '" + dir.wstring() + L"': " + Win32ErrorMessage(writeErr);
+		return false;
+	}
+	DeleteFileW(probe.c_str());
+	return true;
+}
+
+static bool EnsureDirectoryExistsForWrite(const fs::path& dir, std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+	std::error_code ec;
+	if (fs::exists(dir, ec))
+	{
+		if (ec)
+		{
+			if (outErr) *outErr = L"Failed checking directory '" + dir.wstring() + L"': " + Utf8ToWide(ec.message());
+			return false;
+		}
+		if (!fs::is_directory(dir, ec) || ec)
+		{
+			if (outErr) *outErr = L"Path exists but is not a directory: " + dir.wstring();
+			return false;
+		}
+		return true;
+	}
+	fs::create_directories(dir, ec);
+	if (ec)
+	{
+		if (outErr) *outErr = L"Failed to create directory '" + dir.wstring() + L"': " + Utf8ToWide(ec.message());
+		return false;
+	}
+	return true;
+}
+
+static bool CanWriteSettingsIni(std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+	fs::path iniPath = GetSettingsIniPath();
+	fs::path parent = iniPath.has_parent_path() ? iniPath.parent_path() : fs::current_path();
+	if (!EnsureDirectoryExistsForWrite(parent, outErr))
+		return false;
+	return CanCreateAndDeleteTempFileInDirectory(parent, outErr);
+}
+
+static bool IniWriteStringVerified(const wchar_t* section, const wchar_t* key, const std::wstring& value, std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+	const std::wstring iniPath = GetSettingsIniPath();
+	if (!WritePrivateProfileStringW(section, key, value.c_str(), iniPath.c_str()))
+	{
+		DWORD err = GetLastError();
+		if (outErr) *outErr = L"Failed writing settings file '" + iniPath + L"': " + Win32ErrorMessage(err);
+		return false;
+	}
+	wchar_t buf[4096]{};
+	GetPrivateProfileStringW(section, key, L"", buf, (DWORD)_countof(buf), iniPath.c_str());
+	if (std::wstring(buf) != value)
+	{
+		if (outErr) *outErr = L"Settings file write verification failed for '" + iniPath + L"'.";
+		return false;
+	}
+	return true;
+}
 
 static std::wstring IniReadLastFolder()
 {
@@ -359,16 +523,14 @@ static std::wstring IniReadLastFolder()
 	return out;
 }
 
-static void IniWriteLastFolder(const std::wstring& folder)
+static bool IniWriteLastFolder(const std::wstring& folder, std::wstring* outErr = nullptr)
 {
 	std::wstring v = folder;
 	TrimInPlace(v);
 	StripSurroundingQuotes(v);
 	if (v.empty())
-		return;
-	const std::wstring iniPath = GetSettingsIniPath();
-	// This creates the INI if it doesn't exist yet.
-	WritePrivateProfileStringW(kIniSectionSettings, kIniKeyLastFolder, v.c_str(), iniPath.c_str());
+		return true;
+	return IniWriteStringVerified(kIniSectionSettings, kIniKeyLastFolder, v, outErr);
 }
 
 static int IniReadAcceptedTermsVersion()
@@ -385,12 +547,22 @@ static bool HasAcceptedCurrentTerms()
 	return IniReadAcceptedTermsVersion() >= kCurrentTermsVersion;
 }
 
-static void IniWriteAcceptedTermsVersion(int version)
+static bool IniWriteAcceptedTermsVersion(int version, std::wstring* outErr = nullptr)
 {
-	const std::wstring iniPath = GetSettingsIniPath();
+	if (outErr) outErr->clear();
 	const std::wstring versionW = std::to_wstring(version);
-	WritePrivateProfileStringW(kIniSectionLicense, kIniKeyTermsAccepted, L"1", iniPath.c_str());
-	WritePrivateProfileStringW(kIniSectionLicense, kIniKeyTermsVersion, versionW.c_str(), iniPath.c_str());
+	std::wstring err;
+	if (!IniWriteStringVerified(kIniSectionLicense, kIniKeyTermsAccepted, L"1", &err))
+	{
+		if (outErr) *outErr = err;
+		return false;
+	}
+	if (!IniWriteStringVerified(kIniSectionLicense, kIniKeyTermsVersion, versionW, &err))
+	{
+		if (outErr) *outErr = err;
+		return false;
+	}
+	return true;
 }
 
 
@@ -820,6 +992,16 @@ namespace helpers
 		SetWindowTextW(h, tmp.c_str());
 	}
 
+	static std::wstring GetTextCtl(HWND h)
+	{
+		if (!h) return {};
+		int len = GetWindowTextLengthW(h);
+		if (len <= 0) return {};
+		std::wstring out((size_t)len + 1, L'\0');
+		GetWindowTextW(h, out.data(), len + 1);
+		out.resize(wcslen(out.c_str()));
+		return out;
+	}
 
 	static void SetUiForWorkerRunning(AppState* st, bool running)
 	{
@@ -1067,7 +1249,7 @@ namespace helpers
 		return true;
 	}
 
-	// Loads MapPackSyncTool.txt (next to the EXE) into the RichEdit output box.
+	// Loads MapPackSyncTool_Help.txt (next to the EXE) into the RichEdit output box.
 	// - If clearFirst is true, the output is cleared before loading.
 	// - If showErrorBox is true, errors are shown in a MessageBox; otherwise failures are silent.
 	static bool LoadHelpTextIntoOutput(AppState* st, bool clearFirst, bool showErrorBox)
@@ -1580,6 +1762,61 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 	r.ok = true;
 	return r;
 }
+static bool CanWriteClientPrefsArea(const fs::path& localBase, std::wstring* outErr)
+{
+	fs::path prefsDir = localBase / L"prefs";
+	if (!EnsureDirectoryExistsForWrite(prefsDir, outErr))
+		return false;
+	return CanCreateAndDeleteTempFileInDirectory(prefsDir, outErr);
+}
+
+static bool CanWriteSyncArea(const fs::path& localSyncRoot, std::wstring* outErr)
+{
+	if (!EnsureDirectoryExistsForWrite(localSyncRoot, outErr))
+		return false;
+	return CanCreateAndDeleteTempFileInDirectory(localSyncRoot, outErr);
+}
+
+static bool EnsureOperationAccessOrRelaunch(HWND owner, const std::wstring& folderWs, WorkerKind kind)
+{
+	PreflightResult pf = ValidateFolderSelection(folderWs);
+	if (!pf.ok)
+		return true;
+
+	std::wstring writeErr;
+	if (!CanWriteSyncArea(pf.localSyncRoot, &writeErr) || !CanWriteClientPrefsArea(pf.localBase, &writeErr))
+	{
+		if (IsCurrentProcessElevated())
+		{
+			std::wstring msg =
+				L"The selected Istaria folder still is not writable.\r\n\r\n" +
+				writeErr +
+				L"\r\n\r\nPlease choose a writable game folder or adjust permissions.";
+			MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			return false;
+		}
+
+		const wchar_t* opName = (kind == WorkerKind::Remove) ? L"remove MapPack files" : L"sync MapPack files";
+		std::wstring msg =
+			L"The selected Istaria folder requires administrator rights to " + std::wstring(opName) + L".\r\n\r\n" +
+			writeErr +
+			L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
+		if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
+		{
+			std::wstring args = (kind == WorkerKind::Remove) ? L"--auto-remove " : L"--auto-sync ";
+			args += QuoteCommandLineArg(folderWs);
+			if (RelaunchSelfElevated(owner, args))
+			{
+				PostMessageW(owner, WM_CLOSE, 0, 0);
+				return false;
+			}
+			MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		}
+		return false;
+	}
+	return true;
+}
+
 // --------------------------------------------------
 // SHA-256 (Windows CNG / BCrypt)
 // --------------------------------------------------
@@ -3554,7 +3791,11 @@ static unsigned __stdcall WorkerThreadProc(void*)
 
 	// Persist last used folder even when user manually types it (INI created on first write).
 	if (!folderWs.empty())
-		IniWriteLastFolder(folderWs);
+	{
+		std::wstring iniErr;
+		if (!IniWriteLastFolder(folderWs, &iniErr))
+			Log("WARNING: Failed to save last folder to MapPackSyncTool.ini: " + WideToUtf8(iniErr) + "\r\n");
+	}
 
 	SyncConfig cfg;
 	cfg.remoteHost = kRemoteHost;
@@ -4799,7 +5040,30 @@ static bool EnsureTermsAccepted(HWND parent)
 		return false;
 	}
 
-	IniWriteAcceptedTermsVersion(kCurrentTermsVersion);
+	std::wstring iniErr;
+	if (!IniWriteAcceptedTermsVersion(kCurrentTermsVersion, &iniErr))
+	{
+		if (!IsCurrentProcessElevated())
+		{
+			std::wstring msg =
+				L"The Terms were accepted, but MapPackSyncTool.ini could not be written.\r\n\r\n" +
+				iniErr +
+				L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator so the INI can be updated?";
+			if (MessageBoxW(parent, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
+			{
+				if (RelaunchSelfElevated(parent, L"--accept-terms"))
+					return false;
+				MessageBoxW(parent, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			}
+		}
+
+		std::wstring msg =
+			L"MapPackSyncTool.ini could not be written.\r\n\r\n" +
+			iniErr +
+			L"\r\n\r\nThe program will now exit.";
+		MessageBoxW(parent, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
 	return true;
 }
 
@@ -4836,7 +5100,9 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			SetTextCtl(st->hFolderEdit, path.c_str());
 			// Persist selection for next launch (INI created on first write).
 			if (!path.empty())
-				IniWriteLastFolder(path);
+			{
+				std::wstring iniErr; if (!IniWriteLastFolder(path, &iniErr)) Log("WARNING: Failed to save last folder to MapPackSyncTool.ini: " + WideToUtf8(iniErr) + "\r\n");
+			}
 		}
 	}
 	else if ((HWND)lParam == st->hRunButton)
@@ -4857,6 +5123,11 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			Log("ERROR: Aborted - istaria.exe is running. Exit the game before attempting to sync.\r\n");
 			return 0;
 		}
+		std::wstring folder = GetTextCtl(st->hFolderEdit);
+		TrimInPlace(folder);
+		StripSurroundingQuotes(folder);
+		if (!EnsureOperationAccessOrRelaunch(hwnd, folder, WorkerKind::Sync))
+			return 0;
 		StartSyncIfNotRunning();
 	}
 	else if ((HWND)lParam == st->hCancelBtn)
@@ -4887,6 +5158,11 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			Log("ERROR: Aborted remove - istaria.exe is running. Exit the game before attempting to remove.\r\n");
 			return 0;
 		}
+		std::wstring folder = GetTextCtl(st->hFolderEdit);
+		TrimInPlace(folder);
+		StripSurroundingQuotes(folder);
+		if (!EnsureOperationAccessOrRelaunch(hwnd, folder, WorkerKind::Remove))
+			return 0;
 		StartRemoveIfNotRunning();
 	}
 	else if ((HWND)lParam == st->hCopyLogBtn)
@@ -5130,6 +5406,20 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		LocalFree(argv);
 		return rc;
 	}
+	if (argv && argc >= 2 && _wcsicmp(argv[1], L"--accept-terms") == 0)
+	{
+		// No extra setup needed; startup will prompt for terms and write the INI again.
+	}
+	else if (argv && argc >= 3 && _wcsicmp(argv[1], L"--auto-sync") == 0)
+	{
+		g_pendingAutoAction = PendingAutoAction::Sync;
+		g_pendingAutoFolder = argv[2];
+	}
+	else if (argv && argc >= 3 && _wcsicmp(argv[1], L"--auto-remove") == 0)
+	{
+		g_pendingAutoAction = PendingAutoAction::Remove;
+		g_pendingAutoFolder = argv[2];
+	}
 	if (argv) LocalFree(argv);
 	// Enforce single instance for normal GUI mode.
 	if (!AcquireSingleInstanceMutex())
@@ -5199,6 +5489,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		if (!last.empty())
 			SetTextCtl(g_state->hFolderEdit, last.c_str());
 	}
+	if (!g_pendingAutoFolder.empty())
+		SetTextCtl(g_state->hFolderEdit, g_pendingAutoFolder.c_str());
 
 	// ===== DEBUG DEFAULT PATH =====
 	//#if defined(DEBUG_MESSAGE) && defined(_DEBUG)
@@ -5310,6 +5602,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	}
 	LayoutMainWindow(g_state->hMainWnd, g_state);
 	SendMessageW(g_state->hOutput, EM_EXLIMITTEXT, 0, (LPARAM)(8ULL * 1024ULL * 1024ULL));
+	if (g_pendingAutoAction == PendingAutoAction::Sync)
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hRunButton);
+	else if (g_pendingAutoAction == PendingAutoAction::Remove)
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hDeleteBtn);
 	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0))
 	{
