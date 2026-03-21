@@ -61,7 +61,6 @@ Notes
 // ------------------------------------------------------------
 // Version helper: read FileVersion from VERSIONINFO resource
 // ------------------------------------------------------------
-#include <vector>
 
 static std::wstring GetExeFileVersionString()
 {
@@ -895,7 +894,6 @@ namespace helpers
 	}
 
 
-	static void UpdateLogActionButtonsEnabled();
 
 	static void OutputAppendTextW(AppState* st, std::wstring_view text)
 	{
@@ -911,7 +909,7 @@ namespace helpers
 		SendMessageW(st->hOutput, EM_REPLACESEL, FALSE, (LPARAM)tmp.c_str());
 		SendMessageW(st->hOutput, EM_SCROLLCARET, 0, 0);
 
-		UpdateLogActionButtonsEnabled();
+		UpdateLogActionButtonsEnabled(st);
 	}
 
 
@@ -937,36 +935,36 @@ namespace helpers
 			SendMessageW(st->hOutput, WM_VSCROLL, SB_TOP, 0);
 		}
 
-		UpdateLogActionButtonsEnabled();
+		UpdateLogActionButtonsEnabled(st);
 	}
 
-	static void UpdateLogActionButtonsEnabled()
+	static void UpdateLogActionButtonsEnabled(AppState* st)
 	{
-		if (!g_state) return;
-		if (g_state->isRunning.load())
+		if (!st) return;
+		if (st->isRunning.load())
 		{
-			if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, FALSE);
-			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
+			if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, FALSE);
+			if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, FALSE);
 			return;
 		}
 
-		const BOOL enableLogActions = g_state->logActionsArmed ? TRUE : FALSE;
-		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enableLogActions);
-		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enableLogActions);
+		const BOOL enableLogActions = st->logActionsArmed ? TRUE : FALSE;
+		if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, enableLogActions);
+		if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, enableLogActions);
 	}
 
-	static void UpdateCheckUpdatesButtonEnabled()
+	static void UpdateCheckUpdatesButtonEnabled(AppState* st)
 	{
-		if (!g_state || !g_state->hCheckUpdatesBtn) return;
-		const bool enable = !g_state->isRunning.load() && !g_state->isUpdateRunning.load();
-		EnableWindow(g_state->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+		if (!st || !st->hCheckUpdatesBtn) return;
+		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
+		EnableWindow(st->hCheckUpdatesBtn, enable ? TRUE : FALSE);
 	}
 
-	static void UpdateHelpButtonEnabled()
+	static void UpdateHelpButtonEnabled(AppState* st)
 	{
-		if (!g_state || !g_state->hHelpBtn) return;
-		const bool enable = g_state->logActionsArmed && !g_state->isRunning.load();
-		EnableWindow(g_state->hHelpBtn, enable ? TRUE : FALSE);
+		if (!st || !st->hHelpBtn) return;
+		const bool enable = st->logActionsArmed && !st->isRunning.load();
+		EnableWindow(st->hHelpBtn, enable ? TRUE : FALSE);
 	}
 
 
@@ -1026,9 +1024,9 @@ namespace helpers
 		}
 		else
 		{
-			UpdateLogActionButtonsEnabled();
-			UpdateCheckUpdatesButtonEnabled();
-			UpdateHelpButtonEnabled();
+			UpdateLogActionButtonsEnabled(st);
+			UpdateCheckUpdatesButtonEnabled(st);
+			UpdateHelpButtonEnabled(st);
 		}
 
 		// Cancel is the inverse (only enabled while running).
@@ -4789,21 +4787,21 @@ static void StartCheckForUpdates()
 	AppState* st = g_state;
 	if (!st) return;
 	if (st->isUpdateRunning.exchange(true)) return;
-	UpdateCheckUpdatesButtonEnabled();
+	UpdateCheckUpdatesButtonEnabled(st);
 
 	UpdateResult* res = new UpdateResult();
 	uintptr_t th = _beginthreadex(nullptr, 0, UpdateThreadProc, res, 0, nullptr);
 	if (!th)
 	{
 		st->isUpdateRunning.store(false);
-		UpdateCheckUpdatesButtonEnabled();
+		UpdateCheckUpdatesButtonEnabled(st);
 		delete res;
 		Log("ERROR: Failed to start update thread.\r\n");
 		return;
 	}
 	st->hUpdateThread = (HANDLE)th;
 
-	// Waiter thread: waits for the update thread then posts WM_APP+77 with UpdateResult* back to the UI thread.
+	// Waiter thread: waits for the update thread then posts a unified UI event carrying UpdateResult* back to the UI thread.
 	uintptr_t waiter = _beginthreadex(nullptr, 0, [](void* param)->unsigned {
 		auto* pair = (std::pair<AppState*, UpdateResult*>*)param;
 		WaitForSingleObject(pair->first->hUpdateThread, INFINITE);
@@ -5110,7 +5108,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	else if ((HWND)lParam == st->hRunButton)
 	{
 		st->logActionsArmed = true;
-		UpdateHelpButtonEnabled();
+		UpdateHelpButtonEnabled(st);
 		ClearOutput();
 		if (IsProcessRunningByName(L"istaria.exe"))
 		{
@@ -5145,7 +5143,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	else if ((HWND)lParam == st->hDeleteBtn)
 	{
 		st->logActionsArmed = true;
-		UpdateHelpButtonEnabled();
+		UpdateHelpButtonEnabled(st);
 		ClearOutput();
 		if (IsProcessRunningByName(L"istaria.exe"))
 		{
@@ -5169,11 +5167,11 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	}
 	else if ((HWND)lParam == st->hCopyLogBtn)
 	{
-		CopyOutputToClipboard();
+		CopyOutputToClipboard(st);
 	}
 	else if ((HWND)lParam == st->hSaveLogBtn)
 	{
-		SaveOutputToFile();
+		SaveOutputToFile(st);
 	}
 	else if ((HWND)lParam == st->hCheckUpdatesBtn)
 	{
@@ -5191,7 +5189,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		if (r == IDOK)
 		{
 			st->logActionsArmed = false;
-			UpdateHelpButtonEnabled();
+			UpdateHelpButtonEnabled(st);
 			// Clear then load MapPackSyncTool_Help.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
 		}
@@ -5200,7 +5198,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	return DefWindowProc(hwnd, WM_COMMAND, wParam, lParam);
 }
 
-static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
+static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 {
 
 	{
@@ -5208,7 +5206,7 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, WPARAM wParam, L
 		if (st)
 		{
 			st->isUpdateRunning.store(false);
-			UpdateCheckUpdatesButtonEnabled();
+			UpdateCheckUpdatesButtonEnabled(st);
 			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
 		}
 		if (!res->ok)
@@ -5288,7 +5286,7 @@ static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
 	switch (ev->kind)
 	{
 	case UiEventKind::LogAppendW:
-		AppendToOutputW(ev->text.c_str());
+		AppendToOutputW(st2, ev->text);
 		break;
 	case UiEventKind::ProgressMarqueeOn:
 		if (GateProgressUpdate(st2))
@@ -5361,7 +5359,7 @@ static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
 		break;
 	case UiEventKind::UpdateResultPtr:
 		// Transfer ownership of UpdateResult* to the existing handler via lParam.
-		return HandleWmAppUpdateResult(st2, hwnd, 0, (LPARAM)ev->ptr);
+		return HandleWmAppUpdateResult(st2, hwnd, (LPARAM)ev->ptr);
 	default:
 		break;
 	}
@@ -5382,8 +5380,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return HandleWmGetMinMaxInfo(hwnd, lParam);
 	case WM_COMMAND:
 		return HandleWmCommand(st, hwnd, wParam, lParam);
-	case WM_APP + 77:
-		return HandleWmAppUpdateResult(st, hwnd, wParam, lParam);
 	case WM_CLOSE:
 		return HandleWmClose(st, hwnd);
 	case WM_DESTROY:
@@ -5566,8 +5562,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		MAIN_WINDOW_WIDTH - OUTPUT_MARGIN_LEFT - OUTPUT_MARGIN_RIGHT,
 		MAIN_WINDOW_HEIGHT - OUTPUT_MARGIN_TOP - OUTPUT_MARGIN_BOTTOM,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
-	UpdateLogActionButtonsEnabled();
-	UpdateHelpButtonEnabled();
+	UpdateLogActionButtonsEnabled(g_state);
+	UpdateHelpButtonEnabled(g_state);
 	// On startup, load MapPackSyncTool_Help.txt (if present) into the log.
 	LoadHelpTextIntoOutput(true, false);
 	// --------------------------------------------------
