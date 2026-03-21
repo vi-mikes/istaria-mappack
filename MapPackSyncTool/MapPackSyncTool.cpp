@@ -949,8 +949,10 @@ namespace helpers
 			if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, FALSE);
 			return;
 		}
-		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, TRUE);
-		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, g_state->logActionsArmed ? TRUE : FALSE);
+
+		const BOOL enableLogActions = g_state->logActionsArmed ? TRUE : FALSE;
+		if (g_state->hCopyLogBtn) EnableWindow(g_state->hCopyLogBtn, enableLogActions);
+		if (g_state->hSaveLogBtn) EnableWindow(g_state->hSaveLogBtn, enableLogActions);
 	}
 
 	static void UpdateCheckUpdatesButtonEnabled()
