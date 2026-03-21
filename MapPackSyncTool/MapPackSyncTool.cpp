@@ -4493,7 +4493,9 @@ static int CompareNumericVersions(const std::vector<uint32_t>& a, const std::vec
 #ifndef DEBUG_MESSAGE
 static const wchar_t* kAllowedSignerThumbprints[] =
 {
-	L"8788209B20FDFA15C95C40DCBFDC038B54CA11BB", // current signing cert
+	// Below are valid Virtrium Digital Certificate thumbprints:
+	L"8788209B20FDFA15C95C40DCBFDC038B54CA11BB", // 2025 - early 2026 cert
+	L"1cc051c422e32b7ac72744ecc9f37a97602e8c3a", // 2026+ cert
 	// Add future renewal thumbprints here:
 	// L"NEWTHUMBPRINTHERE",
 };
