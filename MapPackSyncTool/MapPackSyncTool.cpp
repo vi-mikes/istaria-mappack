@@ -136,6 +136,8 @@ static inline bool SetErrFromStatus(std::wstring* outErrW, const Status& st) {
 }
 
 
+static bool IsCurrentProcessElevated();
+
 // --------------------------------------------------
 // App identity (window title)
 // --------------------------------------------------
@@ -145,8 +147,13 @@ static inline std::wstring GetDisplayVersion()
 	return L"v" + std::wstring(GetExeFileVersionString().c_str());
 }
 
-static const std::wstring kWindowTitle =
-std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + GetDisplayVersion();
+static std::wstring BuildMainWindowTitle()
+{
+	std::wstring title = std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + GetDisplayVersion();
+	if (IsCurrentProcessElevated())
+		title += L"   <Running in Administrator Mode>";
+	return title;
+}
 
 namespace AppConstants
 {
@@ -430,7 +437,7 @@ static bool CanCreateAndDeleteTempFileInDirectory(const fs::path& dir, std::wstr
 	}
 
 	const DWORD pid = GetCurrentProcessId();
-	const DWORD tick = GetTickCount();
+	const ULONGLONG tick = GetTickCount64();
 	fs::path probe = dir / (L"mpsync_write_test_" + std::to_wstring(pid) + L"_" + std::to_wstring(tick) + L".tmp");
 	HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
 	if (h == INVALID_HANDLE_VALUE)
@@ -5460,7 +5467,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	int winY = (screenH > 0) ? ((screenH - winH) / 2 - 20) : 200;
 	g_state->hMainWnd = CreateWindowEx(
 		exStyle, wc.lpszClassName,
-		kWindowTitle.c_str(),
+		BuildMainWindowTitle().c_str(),
 		style,
 		winX, winY, winW, winH,
 		nullptr, nullptr, hInst, nullptr);
