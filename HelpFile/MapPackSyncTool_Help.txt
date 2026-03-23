@@ -1,18 +1,19 @@
-Welcome to MapPack Sync Tool by Cegaiel.
+MapPack Sync Tool by Cegaiel.
 
-MapPack 5.0 (newly implemented) uses \resources_override\mappack\resources folder.
-MapPack 4.0 (deprecated) uses resources_override\resources folder, which we've incorrectly used for many years.
-This new path is what differentiates 4.0 vs 5.0.
+- MapPack 5.0 (newly implemented) now uses ' \resources_override\mappack\resources ' folder.
+- MapPack 4.0 (deprecated) previously used ' \resources_override\resources ' folder; Not the best method for mod compatibility.
+- This new path is what differentiates 4.0 vs 5.0 going forward.
 
-The reason we are using \resources_override\mappack\resources now is so that it is more mod friendly.
-It will help to avoid confusion when you add mod files that previously shared folders that MapPack 4.0 used.
+The reason we are using ' \resources_override\mappack\resources ' instead is so that it is more mod friendly.
+It will help to avoid confusion/conflicts when using other mods which likely shares folders that MapPack 4.0 previously used.
 
-Now we can be sure that any files that exist in the \resources_override\mappack files should only contain mappack files.
+This ensures that any files that exist in the ' \resources_override\mappack ' folder should ONLY contain mappack files.
 Hence this folder can be safely deleted, in future, without potentially removing mod files that you might've added.
 
-After Add/Sync'ing: You can continue using \resources_override\resources folder for any existing mods and keep it separate from MapPack files which was previously intertwined. Syncing will remove any old mappack 4.0 folders/files (only if listed in manifest) and add new mappack 5.0 folders/files. There should be no issues, after syncing MapPack, for it to continue/start working.
+Add/Sync button fully automates adding (install) and/or syncing (updating files) MapPack 5.0 - which will add/remove/sync/delete any files/folders that differ from downloaded manifest.
 
-Explanation of buttons:
+Remove button will fully delete BOTH MapPack 4.0 or 5.0 (both files/folders) and switch it back to the original vanilla (default game install) installation.
+
 
 Browse button:
 - Select the folder your Istaria game exists. The selected folder MUST contain istaria.exe (to verify you're in the correct path).
@@ -32,5 +33,4 @@ Remove button:
 - Uninstall MapPack. This will remove BOTH MapPack 5.0 as well any older versions such as 4.0 listed in manifest.
 - This will also verify and set 'string mapPath = "resources/interface/maps"' which is the original/vanilla path.
 
-
-If you get any errors about deletions then run this file as Administrator (right click file, Run as Admin).
+This program does check if you can write files in the appropriate folders, when using Add/Sync, Remove or Update buttons when used. If file writing fails it will attempt to restart the program in Administrator mode (you will need to confirm permissions via popup box).
