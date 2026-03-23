@@ -111,8 +111,7 @@ Legacy `.doc` format is not used due to deprecation and reduced reliability.
 1. Launch `MapPackSyncTool.exe`
 2. Select your Istaria resources folder
 3. Choose an operation:
-   - Add
-   - Sync
+   - Add / Sync
    - Remove
 4. Monitor progress and logs
 5. Use "Check for Updates" to verify latest version
