@@ -136,8 +136,6 @@ static inline bool SetErrFromStatus(std::wstring* outErrW, const Status& st) {
 }
 
 
-static bool IsCurrentProcessElevated();
-
 // --------------------------------------------------
 // App identity (window title)
 // --------------------------------------------------
@@ -147,13 +145,8 @@ static inline std::wstring GetDisplayVersion()
 	return L"v" + std::wstring(GetExeFileVersionString().c_str());
 }
 
-static std::wstring BuildMainWindowTitle()
-{
-	std::wstring title = std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + GetDisplayVersion();
-	if (IsCurrentProcessElevated())
-		title += L"   <Running in Administrator Mode>";
-	return title;
-}
+static const std::wstring kWindowTitle =
+std::wstring(MAP_PACK_SYNC_TOOL_NAME) + L" " + GetDisplayVersion();
 
 namespace AppConstants
 {
@@ -324,6 +317,7 @@ enum class PendingAutoAction
 	None = 0,
 	Sync,
 	Remove,
+	Update,
 };
 
 static PendingAutoAction g_pendingAutoAction = PendingAutoAction::None;
@@ -1782,6 +1776,53 @@ static bool CanWriteSyncArea(const fs::path& localSyncRoot, std::wstring* outErr
 	if (!EnsureDirectoryExistsForWrite(localSyncRoot, outErr))
 		return false;
 	return CanCreateAndDeleteTempFileInDirectory(localSyncRoot, outErr);
+}
+
+static bool CanWriteApplicationDirectory(std::wstring* outErr)
+{
+	fs::path exePath = GetThisExePath();
+	if (exePath.empty())
+	{
+		if (outErr) *outErr = L"Could not determine the application path.";
+		return false;
+	}
+
+	fs::path appDir = exePath.parent_path();
+	if (!EnsureDirectoryExistsForWrite(appDir, outErr))
+		return false;
+	return CanCreateAndDeleteTempFileInDirectory(appDir, outErr);
+}
+
+static bool EnsureUpdateAccessOrRelaunch(HWND owner)
+{
+	std::wstring writeErr;
+	if (CanWriteApplicationDirectory(&writeErr) && CanWriteSettingsIni(&writeErr))
+		return true;
+
+	if (IsCurrentProcessElevated())
+	{
+		std::wstring msg =
+			L"The application folder or settings location still is not writable.\r\n\r\n" +
+			writeErr +
+			L"\r\n\r\nPlease adjust permissions or move the application to a writable location.";
+		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	std::wstring msg =
+		L"Administrator rights are required to update MapPack Sync Tool or write MapPackSyncTool.ini in the current location.\r\n\r\n" +
+		writeErr +
+		L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
+	if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
+	{
+		if (RelaunchSelfElevated(owner, L"--auto-update"))
+		{
+			PostMessageW(owner, WM_CLOSE, 0, 0);
+			return false;
+		}
+		MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+	}
+	return false;
 }
 
 static bool EnsureOperationAccessOrRelaunch(HWND owner, const std::wstring& folderWs, WorkerKind kind)
@@ -5184,6 +5225,8 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	}
 	else if ((HWND)lParam == st->hCheckUpdatesBtn)
 	{
+		if (!EnsureUpdateAccessOrRelaunch(hwnd))
+			return 0;
 		StartCheckForUpdates();
 	}
 	else if ((HWND)lParam == st->hHelpBtn)
@@ -5427,6 +5470,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		g_pendingAutoAction = PendingAutoAction::Remove;
 		g_pendingAutoFolder = argv[2];
 	}
+	else if (argv && argc >= 2 && _wcsicmp(argv[1], L"--auto-update") == 0)
+	{
+		g_pendingAutoAction = PendingAutoAction::Update;
+	}
 	if (argv) LocalFree(argv);
 	// Enforce single instance for normal GUI mode.
 	if (!AcquireSingleInstanceMutex())
@@ -5467,7 +5514,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	int winY = (screenH > 0) ? ((screenH - winH) / 2 - 20) : 200;
 	g_state->hMainWnd = CreateWindowEx(
 		exStyle, wc.lpszClassName,
-		BuildMainWindowTitle().c_str(),
+		kWindowTitle.c_str(),
 		style,
 		winX, winY, winW, winH,
 		nullptr, nullptr, hInst, nullptr);
@@ -5613,6 +5660,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hRunButton);
 	else if (g_pendingAutoAction == PendingAutoAction::Remove)
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hDeleteBtn);
+	else if (g_pendingAutoAction == PendingAutoAction::Update)
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hCheckUpdatesBtn);
 	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0))
 	{
