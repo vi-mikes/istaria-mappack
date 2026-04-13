@@ -4302,6 +4302,7 @@ struct UpdateResult
 {
 	bool ok = false;
 	bool different = false;
+	bool quietIfNoUpdate = false;
 	std::wstring localVersion;
 	std::wstring remoteVersion;
 	std::string expectedSha256Lower; // from version.txt line 2
@@ -4832,7 +4833,7 @@ static unsigned __stdcall UpdateThreadProc(void* p)
 	return 0;
 }
 
-static void StartCheckForUpdates()
+static void StartCheckForUpdates(bool quietIfNoUpdate = false)
 {
 	AppState* st = g_state;
 	if (!st) return;
@@ -4840,13 +4841,15 @@ static void StartCheckForUpdates()
 	UpdateCheckUpdatesButtonEnabled(st);
 
 	UpdateResult* res = new UpdateResult();
+	res->quietIfNoUpdate = quietIfNoUpdate;
 	uintptr_t th = _beginthreadex(nullptr, 0, UpdateThreadProc, res, 0, nullptr);
 	if (!th)
 	{
 		st->isUpdateRunning.store(false);
 		UpdateCheckUpdatesButtonEnabled(st);
 		delete res;
-		Log("ERROR: Failed to start update thread.\r\n");
+		if (!quietIfNoUpdate)
+			Log("ERROR: Failed to start update thread.\r\n");
 		return;
 	}
 	st->hUpdateThread = (HANDLE)th;
@@ -5227,7 +5230,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	{
 		if (!EnsureUpdateAccessOrRelaunch(hwnd))
 			return 0;
-		StartCheckForUpdates();
+		StartCheckForUpdates(false);
 	}
 	else if ((HWND)lParam == st->hHelpBtn)
 	{
@@ -5261,17 +5264,25 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 			UpdateCheckUpdatesButtonEnabled(st);
 			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
 		}
+
+		const bool quietIfNoUpdate = res->quietIfNoUpdate;
 		if (!res->ok)
 		{
-			std::wstring msg = L"Update check failed:\r\n\r\n" + res->err;
-			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			if (!quietIfNoUpdate)
+			{
+				std::wstring msg = L"Update check failed:\r\n\r\n" + res->err;
+				MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			}
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
 		}
 		if (!res->different)
 		{
-			std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
-			MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
+			if (!quietIfNoUpdate)
+			{
+				std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
+				MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
+			}
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
 		}
@@ -5657,11 +5668,22 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	LayoutMainWindow(g_state->hMainWnd, g_state);
 	SendMessageW(g_state->hOutput, EM_EXLIMITTEXT, 0, (LPARAM)(8ULL * 1024ULL * 1024ULL));
 	if (g_pendingAutoAction == PendingAutoAction::Sync)
+	{
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hRunButton);
+	}
 	else if (g_pendingAutoAction == PendingAutoAction::Remove)
+	{
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hDeleteBtn);
+	}
 	else if (g_pendingAutoAction == PendingAutoAction::Update)
+	{
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hCheckUpdatesBtn);
+	}
+	else
+	{
+		if (EnsureUpdateAccessOrRelaunch(g_state->hMainWnd))
+			StartCheckForUpdates(true);
+	}
 	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0))
 	{
