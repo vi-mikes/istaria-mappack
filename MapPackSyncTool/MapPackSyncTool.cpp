@@ -331,6 +331,8 @@ static std::wstring Utf8ToWide(const std::string& s);
 static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out);
 static bool RelaunchSelfElevated(HWND owner, const std::wstring& parameters);
 static bool IsCurrentProcessElevated();
+static std::wstring BuildCurrentCommandLineArgumentsForRelaunch();
+static void ReleaseSingleInstanceMutex();
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -344,6 +346,10 @@ static const wchar_t* kIniKeyTermsAccepted = L"TermsAccepted";
 static const wchar_t* kIniKeyTermsVersion = L"TermsVersion";
 static constexpr int kCurrentTermsVersion = 1;
 static const wchar_t* kTermsFileName = L"MapPackSyncTool_Terms.txt";
+static constexpr const char* kSupportFileHelpPath = "/MapPackSyncTool_Help.txt";
+static constexpr const char* kSupportFileTermsPath = "/MapPackSyncTool_Terms.txt";
+static constexpr const char* kSupportFileReadmeDocxPath = "/README.docx";
+static constexpr const char* kSupportFileReadmeRtfPath = "/README.rtf";
 
 static std::wstring GetSettingsIniPath()
 {
@@ -403,6 +409,28 @@ static std::wstring QuoteCommandLineArg(const std::wstring& arg)
 	}
 	out.push_back(L'"');
 	return out;
+}
+
+static std::wstring BuildCurrentCommandLineArgumentsForRelaunch()
+{
+	int argc = 0;
+	wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	if (!argv || argc <= 1)
+	{
+		if (argv) LocalFree(argv);
+		return L"";
+	}
+
+	std::wstring args;
+	for (int i = 1; i < argc; ++i)
+	{
+		if (!args.empty())
+			args.push_back(L' ');
+		args += QuoteCommandLineArg(argv[i] ? argv[i] : L"");
+	}
+
+	LocalFree(argv);
+	return args;
 }
 
 static bool RelaunchSelfElevated(HWND owner, const std::wstring& parameters)
@@ -1825,6 +1853,152 @@ static bool EnsureUpdateAccessOrRelaunch(HWND owner)
 	return false;
 }
 
+static bool DownloadUrlToFileNoVerify(
+	const std::string& url,
+	const fs::path& destFile,
+	const CancelToken& cancel,
+	std::string* outErr,
+	long* outHttp);
+
+struct StartupSupportFile
+{
+	const char* remotePath;
+	const wchar_t* localName;
+	bool required;
+};
+
+static bool DownloadStartupSupportFile(const StartupSupportFile& file, const fs::path& appDir, std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+
+	const std::string url = std::string(kRemoteHost) + file.remotePath;
+	const fs::path dest = appDir / file.localName;
+	CancelToken noCancel{};
+	std::string dlErr;
+	long http = 0;
+
+	if (!DownloadUrlToFileNoVerify(url, dest, noCancel, &dlErr, &http))
+	{
+		std::wstring msg = L"Failed to download " + std::wstring(file.localName) + L".";
+		if (http != 0)
+			msg += L"\r\nHTTP status: " + std::to_wstring(http);
+		if (!dlErr.empty())
+			msg += L"\r\n" + Utf8ToWide(dlErr);
+		if (outErr) *outErr = msg;
+		return false;
+	}
+
+	return true;
+}
+
+static bool EnsureStartupSupportFilesAccessOrRelaunch(HWND owner)
+{
+	std::wstring writeErr;
+	if (CanWriteApplicationDirectory(&writeErr))
+		return true;
+
+	if (IsCurrentProcessElevated())
+	{
+		std::wstring msg =
+			L"The application folder is not writable, so startup support files could not be refreshed.\r\n\r\n" +
+			writeErr +
+			L"\r\n\r\nPlease adjust permissions or move the application to a writable location.";
+		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	std::wstring msg =
+		L"MapPack Sync Tool needs to refresh its support files in the application folder.\r\n\r\n" +
+		writeErr +
+		L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
+	if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
+	{
+		// Preserve any startup arguments, such as --auto-sync/--auto-remove/--auto-update.
+		// Release the single-instance mutex before launching the elevated copy so the
+		// elevated process is not mistaken for a second instance and immediately closed.
+		std::wstring args = BuildCurrentCommandLineArgumentsForRelaunch();
+		ReleaseSingleInstanceMutex();
+		if (RelaunchSelfElevated(owner, args))
+			return false;
+		MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+	}
+	return false;
+}
+
+static bool RefreshStartupSupportFiles(HWND owner)
+{
+	if (!EnsureStartupSupportFilesAccessOrRelaunch(owner))
+		return false;
+
+	fs::path exePath = GetThisExePath();
+	fs::path appDir;
+	if (!exePath.empty())
+	{
+		appDir = exePath.parent_path();
+	}
+	else
+	{
+		std::error_code ec;
+		appDir = fs::current_path(ec);
+		if (ec)
+		{
+			std::wstring msg = L"Could not determine the application folder.\r\n\r\n" + Utf8ToWide(ec.message());
+			MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+			return false;
+		}
+	}
+
+	const StartupSupportFile files[] =
+	{
+		{ kSupportFileHelpPath, L"MapPackSyncTool_Help.txt", true },
+		{ kSupportFileTermsPath, kTermsFileName, true },
+		{ kSupportFileReadmeDocxPath, L"README.docx", false },
+		{ kSupportFileReadmeRtfPath, L"README.rtf", false },
+	};
+
+	std::wstring requiredErrors;
+	std::wstring optionalErrors;
+
+	for (const StartupSupportFile& file : files)
+	{
+		std::wstring err;
+		if (!DownloadStartupSupportFile(file, appDir, &err))
+		{
+			if (file.required)
+			{
+				if (!requiredErrors.empty()) requiredErrors += L"\r\n\r\n";
+				requiredErrors += err;
+			}
+			else
+			{
+				if (!optionalErrors.empty()) optionalErrors += L"\r\n\r\n";
+				optionalErrors += err;
+			}
+		}
+	}
+
+	if (!requiredErrors.empty())
+	{
+		std::wstring msg =
+			L"MapPack Sync Tool could not refresh one or more required startup files.\r\n\r\n" +
+			requiredErrors +
+			L"\r\n\r\nThe program will now exit.";
+		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	if (!optionalErrors.empty())
+	{
+		std::wstring msg =
+			L"MapPack Sync Tool refreshed the required startup files, but one or more informational README files could not be downloaded.\r\n\r\n" +
+			optionalErrors +
+			L"\r\n\r\nThe program will continue.";
+		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONWARNING);
+	}
+
+	return true;
+}
+
 static bool EnsureOperationAccessOrRelaunch(HWND owner, const std::wstring& folderWs, WorkerKind kind)
 {
 	PreflightResult pf = ValidateFolderSelection(folderWs);
@@ -3149,6 +3323,66 @@ static bool DownloadUrlToFileVerifySha256(
 	}
 	return true;
 }
+static bool DownloadUrlToFileNoVerify(
+	const std::string& url,
+	const fs::path& destFile,
+	const CancelToken& cancel,
+	std::string* outErr = nullptr,
+	long* outHttp = nullptr)
+{
+	if (outErr) outErr->clear();
+	if (outHttp) *outHttp = 0;
+
+	std::error_code ec;
+	fs::create_directories(destFile.parent_path(), ec);
+	if (ec)
+	{
+		if (outErr) *outErr = "create_directories failed: " + ec.message();
+		return false;
+	}
+
+	fs::path tmp = destFile;
+	tmp += L".download";
+	fs::remove(tmp, ec);
+	ec.clear();
+
+	DlFileHashCtx ctx{};
+	_wfopen_s(&ctx.f, tmp.wstring().c_str(), L"wb");
+	if (!ctx.f)
+	{
+		if (outErr) *outErr = "Failed to open temp download file for writing";
+		return false;
+	}
+
+	const long connectMs = AppConstants::kFileConnectTimeoutMs;
+	const long totalMs = AppConstants::kFileTimeoutMs;
+	std::string dlErr;
+	long code = 0;
+	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs, &dlErr, &code);
+	if (outHttp) *outHttp = code;
+
+	fflush(ctx.f);
+	fclose(ctx.f);
+	ctx.f = nullptr;
+
+	if (!ok || !ctx.ok)
+	{
+		fs::remove(tmp, ec);
+		if (outErr) *outErr = !dlErr.empty() ? dlErr : (ctx.ok ? "Download failed" : "Write failure during download");
+		return false;
+	}
+
+	if (!MoveReplace(tmp, destFile))
+	{
+		DWORD err = GetLastError();
+		fs::remove(tmp, ec);
+		if (outErr) *outErr = "Failed to replace destination file (win32=" + std::to_string(err) + ")";
+		return false;
+	}
+
+	return true;
+}
+
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
@@ -3624,7 +3858,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 			std::string localHash;
 			if (!Sha256FileHexLower(localFile, localHash))
 			{
-				Log("FAILED HASH (local): " + rel + "\r\n");
+				Log("  FAILED HASH (local): " + rel + "\r\n");
 				++ioCounts.failed;
 				continue;
 			}
@@ -3639,7 +3873,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 		bool existed = fs::exists(localFile);
 		if (!DownloadUrlToFileVerifySha256(fileUrl, localFile, expectedHash, cancel, &dlErr2, &http2))
 		{
-			Log("FAILED DOWNLOAD: " + rel + " (HTTP " + std::to_string(http2) + ") " + dlErr2 + "\r\n");
+			Log("  FAILED DOWNLOAD: " + rel + " (HTTP " + std::to_string(http2) + ") " + dlErr2 + "\r\n");
 			++ioCounts.failed;
 			continue;
 		}
@@ -3650,7 +3884,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 		}
 		else
 		{
-			Log("UPDATED: resources_override/mappack/" + rel + "\r\n");
+			Log("  UPDATED: resources_override/mappack/" + rel + "\r\n");
 			++ioCounts.updated; anyChanged = true;
 		}
 	}
@@ -5534,6 +5768,39 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	SendMessageW(g_state->hMainWnd, WM_SETICON, ICON_SMALL, (LPARAM)wc.hIconSm);
 	ShowWindow(g_state->hMainWnd, SW_SHOW);
 	UpdateWindow(g_state->hMainWnd);
+
+	// Startup support files are refreshed before the main controls are created.
+	// Show a temporary status so the first launch does not look like a blank/hung window.
+	SetWindowTextW(g_state->hMainWnd, L"MapPack Sync Tool - Checking for Help/Support files updates...");
+	HWND hStartupStatus = CreateWindowW(
+		L"STATIC",
+		L"Checking for Help/Support files updates...",
+		WS_CHILD | WS_VISIBLE | SS_CENTER,
+		0, (MAIN_WINDOW_HEIGHT / 2) - 20, MAIN_WINDOW_WIDTH, 20,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
+	if (hStartupStatus && g_state->hFontUI)
+		SendMessageW(hStartupStatus, WM_SETFONT, (WPARAM)g_state->hFontUI, TRUE);
+	UpdateWindow(g_state->hMainWnd);
+	if (hStartupStatus)
+		UpdateWindow(hStartupStatus);
+
+	if (!RefreshStartupSupportFiles(g_state->hMainWnd))
+	{
+		if (hStartupStatus) DestroyWindow(hStartupStatus);
+		SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
+		DestroyWindow(g_state->hMainWnd);
+		ReleaseSingleInstanceMutex();
+		return 0;
+	}
+
+	if (hStartupStatus)
+	{
+		DestroyWindow(hStartupStatus);
+		hStartupStatus = nullptr;
+	}
+	SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
+	UpdateWindow(g_state->hMainWnd);
+
 	if (!EnsureTermsAccepted(g_state->hMainWnd))
 	{
 		DestroyWindow(g_state->hMainWnd);
