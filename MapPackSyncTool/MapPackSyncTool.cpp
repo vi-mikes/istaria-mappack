@@ -178,15 +178,15 @@ static constexpr const wchar_t* kLegacyUpdaterExeFileName = L"MapPackSyncTool_Up
 // --------------------------------------------------
 // Global UI layout (initial size + margins)
 // --------------------------------------------------
-static const int MAIN_WINDOW_WIDTH = 825;  // initial window width
-static const int MAIN_WINDOW_HEIGHT = 800;   // initial window height
+static const int MAIN_WINDOW_WIDTH = 850;  // initial window width
+static const int MAIN_WINDOW_HEIGHT = 850;   // initial window height
 // RichEdit margins (client area)
 static const int OUTPUT_MARGIN_LEFT = 10;
 static const int OUTPUT_MARGIN_TOP = 95;
 static const int OUTPUT_MARGIN_RIGHT = 10;
 static const int OUTPUT_MARGIN_BOTTOM = 10;
 // Minimum client size (prevents resizing too small)
-static const int MIN_CLIENT_W = 825;
+static const int MIN_CLIENT_W = MAIN_WINDOW_WIDTH;
 static const int MIN_CLIENT_H = MAIN_WINDOW_HEIGHT;
 
 // --------------------------------------------------
@@ -283,12 +283,15 @@ struct AppState
 	HWND hCopyLogBtn = nullptr;
 	HWND hSaveLogBtn = nullptr;
 	HWND hCheckUpdatesBtn = nullptr;
+	HWND hChangeLogBtn = nullptr;
 	HWND hHelpBtn = nullptr;
+	HWND hAboutBtn = nullptr;
 	HWND hFolderEdit = nullptr;
 	HWND hOutput = nullptr;
 	HWND hProgress = nullptr;
 	HWND hProgressText = nullptr;
 	HWND hTooltip = nullptr;
+	HWND hStatusBar = nullptr;
 	HFONT hFontUI = nullptr;
 	HFONT hFontMono = nullptr;
 	HANDLE hWorkerThread = nullptr;
@@ -318,6 +321,7 @@ enum class PendingAutoAction
 	Sync,
 	Remove,
 	Update,
+	ChangeLog,
 };
 
 static PendingAutoAction g_pendingAutoAction = PendingAutoAction::None;
@@ -325,6 +329,7 @@ static std::wstring g_pendingAutoFolder;
 
 // Forward declarations used before their definitions.
 static fs::path GetThisExePath();
+static bool GetApplicationDirectory(fs::path& outAppDir, std::wstring* outErr);
 static void TrimInPlace(std::wstring& s);
 static void StripSurroundingQuotes(std::wstring& s);
 static std::wstring Utf8ToWide(const std::string& s);
@@ -333,6 +338,7 @@ static bool RelaunchSelfElevated(HWND owner, const std::wstring& parameters);
 static bool IsCurrentProcessElevated();
 static std::wstring BuildCurrentCommandLineArgumentsForRelaunch();
 static void ReleaseSingleInstanceMutex();
+static void ShowAboutSystemInfoDialog(HWND owner);
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -344,12 +350,15 @@ static const wchar_t* kIniKeyLastFolder = L"LastFolder";
 static const wchar_t* kIniSectionLicense = L"License";
 static const wchar_t* kIniKeyTermsAccepted = L"TermsAccepted";
 static const wchar_t* kIniKeyTermsVersion = L"TermsVersion";
+// Should I ever come out with new Terms of Use, then increment below line by one number.
+// This will show user latest terms and force them to Accept the latest terms of use again; Hence updating [License] TermsVersion in the .ini file.
 static constexpr int kCurrentTermsVersion = 1;
-static const wchar_t* kTermsFileName = L"MapPackSyncTool_Terms.txt";
-static constexpr const char* kSupportFileHelpPath = "/MapPackSyncTool_Help.txt";
-static constexpr const char* kSupportFileTermsPath = "/MapPackSyncTool_Terms.txt";
-static constexpr const char* kSupportFileReadmeDocxPath = "/README.docx";
-static constexpr const char* kSupportFileReadmeRtfPath = "/README.rtf";
+static const wchar_t* kLocalTermsFileName = L"MapPackSyncTool_Terms.txt";
+static constexpr const char* kRemoteSupportHelpPath = "/MapPackSyncTool_Help.txt";
+static constexpr const char* kRemoteSupportTermsPath = "/MapPackSyncTool_Terms.txt";
+static constexpr const char* kRemoteSupportReadmeDocxPath = "/README.docx";
+static constexpr const char* kRemoteSupportReadmeRtfPath = "/README.rtf";
+static constexpr const char* kRemoteChangeLogFilePath = "/changelog.txt";
 
 static std::wstring GetSettingsIniPath()
 {
@@ -509,7 +518,7 @@ static bool EnsureDirectoryExistsForWrite(const fs::path& dir, std::wstring* out
 	return true;
 }
 
-static bool CanWriteSettingsIni(std::wstring* outErr)
+static bool CanWriteToSettingsIniLocation(std::wstring* outErr)
 {
 	if (outErr) outErr->clear();
 	fs::path iniPath = GetSettingsIniPath();
@@ -620,59 +629,78 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	const int rowY = 12;
 	const int ctrlH = 22;
 	const int gap = 8;
+	const int groupGap = 28;
 	const int labelW = 170;
 	// Buttons anchored to the right
 	const int btnW = 92;
 	const int btnH = ctrlH;
 	int right = cw - m;
-	int deleteX = right - btnW;
-	int cancelX = deleteX - gap - btnW;
-	int runX = cancelX - gap - btnW;
-	int browseX = runX - gap - btnW;
+
+	// Folder row: keep Browse attached to the path field and anchored right.
+	int browseX = right - btnW;
+
 	int labelX = m;
 	int labelY = 15;
 	int editX = labelX + labelW + gap;
 	int editY = rowY;
 	int editW = browseX - gap - editX;
 	if (editW < 50) editW = 50;
-	// Progress bar + status text
-	int progY = rowY + ctrlH + 10;
+	// Button row under the folder path:
+	// - Add/Sync, Cancel Sync, Remove, Check for Updates, and Change Log flow left-to-right.
+	// - Copy/Save/? remain right-aligned.
+	// Both progress controls sit below this button row.
+	const int updateW = 130;
+	const int changeLogW = 92;
+	const int helpW = 22;
+	const int aboutW = 22;
+	int buttonRowY = rowY + ctrlH + 10;
+	int progY = buttonRowY + btnH + 8;
 	int progW = cw - (m * 2);
 	if (progW < 10) progW = 10;
-
-	// Check-for-updates + Copy/Save buttons live on the progress-text row (right side)
-	const int updateW = 130;
-	const int helpW = 22;
 	int progTextY = progY + 18;
-	int helpX = right - helpW;
-	int saveLogX = helpX - gap - btnW;
+	int progTextW = progW;
+
+	int runX = m;
+	int cancelX = runX + btnW + gap;
+	int deleteX = cancelX + btnW + gap;
+
+	// Group 1: main operations.
+	// Group 2: information/actions.
+	// Group 3: log export buttons anchored to the far right.
+	int updateX = deleteX + btnW + groupGap;
+	int changeLogX = updateX + updateW + gap;
+	int helpX = changeLogX + changeLogW + gap;
+	int aboutX = helpX + helpW + gap;
+
+	int saveLogX = right - btnW;
 	int copyLogX = saveLogX - gap - btnW;
-	int updateX = copyLogX - gap - updateW;
-	int progTextW = updateX - gap - m;
-	if (progTextW < 50) progTextW = 50;
 
 	// Output box fills remaining space
-	int outY = progY + 44;
+	int outY = progTextY + 22 + 8;
 	int outW = cw - (m * 2);
-	int outH = ch - outY - m;
+	const int statusH = 22;
+	int outH = ch - outY - statusH - m;
 	if (outW < 10) outW = 10;
 	if (outH < 10) outH = 10;
 	// Batch repositioning to reduce redraw/flicker
-	HDWP hdwp = BeginDeferWindowPos(13);
+	HDWP hdwp = BeginDeferWindowPos(16);
 	if (!hdwp) {
 		if (st->hFolderLabel) MoveWindow(st->hFolderLabel, labelX, labelY, labelW, 20, TRUE);
 		if (st->hFolderEdit)  MoveWindow(st->hFolderEdit, editX, editY, editW, ctrlH, TRUE);
 		if (st->hBrowseBtn)   MoveWindow(st->hBrowseBtn, browseX, rowY, btnW, btnH, TRUE);
-		if (st->hRunButton)   MoveWindow(st->hRunButton, runX, rowY, btnW, btnH, TRUE);
-		if (st->hCancelBtn)   MoveWindow(st->hCancelBtn, cancelX, rowY, btnW, btnH, TRUE);
-		if (st->hDeleteBtn)   MoveWindow(st->hDeleteBtn, deleteX, rowY, btnW, btnH, TRUE);
+		if (st->hRunButton)   MoveWindow(st->hRunButton, runX, buttonRowY, btnW, btnH, TRUE);
+		if (st->hCancelBtn)   MoveWindow(st->hCancelBtn, cancelX, buttonRowY, btnW, btnH, TRUE);
+		if (st->hDeleteBtn)   MoveWindow(st->hDeleteBtn, deleteX, buttonRowY, btnW, btnH, TRUE);
 		if (st->hProgress)     MoveWindow(st->hProgress, m, progY, progW, 14, TRUE);
 		if (st->hProgressText) MoveWindow(st->hProgressText, m, progTextY, progTextW, 22, TRUE);
-		if (st->hCheckUpdatesBtn) MoveWindow(st->hCheckUpdatesBtn, updateX, progTextY, updateW, btnH, TRUE);
-		if (st->hCopyLogBtn)   MoveWindow(st->hCopyLogBtn, copyLogX, progTextY, btnW, btnH, TRUE);
-		if (st->hSaveLogBtn)   MoveWindow(st->hSaveLogBtn, saveLogX, progTextY, btnW, btnH, TRUE);
-		if (st->hHelpBtn)         MoveWindow(st->hHelpBtn, helpX, progTextY, helpW, btnH, TRUE);
+		if (st->hCheckUpdatesBtn) MoveWindow(st->hCheckUpdatesBtn, updateX, buttonRowY, updateW, btnH, TRUE);
+		if (st->hChangeLogBtn)    MoveWindow(st->hChangeLogBtn, changeLogX, buttonRowY, changeLogW, btnH, TRUE);
+		if (st->hCopyLogBtn)   MoveWindow(st->hCopyLogBtn, copyLogX, buttonRowY, btnW, btnH, TRUE);
+		if (st->hSaveLogBtn)   MoveWindow(st->hSaveLogBtn, saveLogX, buttonRowY, btnW, btnH, TRUE);
+		if (st->hHelpBtn)      MoveWindow(st->hHelpBtn, helpX, buttonRowY, helpW, btnH, TRUE);
+		if (st->hAboutBtn)     MoveWindow(st->hAboutBtn, aboutX, buttonRowY, aboutW, btnH, TRUE);
 		if (st->hOutput)       MoveWindow(st->hOutput, m, outY, outW, outH, TRUE);
+		if (st->hStatusBar)    MoveWindow(st->hStatusBar, 0, ch - statusH, cw, statusH, TRUE);
 		return;
 	}
 	auto defer = [&](HWND h, int x, int y, int w, int hgt) {
@@ -682,16 +710,19 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	defer(st->hFolderLabel, labelX, labelY, labelW, 20);
 	defer(st->hFolderEdit, editX, editY, editW, ctrlH);
 	defer(st->hBrowseBtn, browseX, rowY, btnW, btnH);
-	defer(st->hRunButton, runX, rowY, btnW, btnH);
-	defer(st->hCancelBtn, cancelX, rowY, btnW, btnH);
-	defer(st->hDeleteBtn, deleteX, rowY, btnW, btnH);
+	defer(st->hRunButton, runX, buttonRowY, btnW, btnH);
+	defer(st->hCancelBtn, cancelX, buttonRowY, btnW, btnH);
+	defer(st->hDeleteBtn, deleteX, buttonRowY, btnW, btnH);
 	defer(st->hProgress, m, progY, progW, 14);
 	defer(st->hProgressText, m, progTextY, progTextW, 22);
-	defer(st->hCheckUpdatesBtn, updateX, progTextY, updateW, btnH);
-	defer(st->hCopyLogBtn, copyLogX, progTextY, btnW, btnH);
-	defer(st->hSaveLogBtn, saveLogX, progTextY, btnW, btnH);
-	defer(st->hHelpBtn, helpX, progTextY, helpW, btnH);
+	defer(st->hCheckUpdatesBtn, updateX, buttonRowY, updateW, btnH);
+	defer(st->hChangeLogBtn, changeLogX, buttonRowY, changeLogW, btnH);
+	defer(st->hCopyLogBtn, copyLogX, buttonRowY, btnW, btnH);
+	defer(st->hSaveLogBtn, saveLogX, buttonRowY, btnW, btnH);
+	defer(st->hHelpBtn, helpX, buttonRowY, helpW, btnH);
+	defer(st->hAboutBtn, aboutX, buttonRowY, aboutW, btnH);
 	defer(st->hOutput, m, outY, outW, outH);
+	defer(st->hStatusBar, 0, ch - statusH, cw, statusH);
 	EndDeferWindowPos(hdwp);
 }
 // Custom message for log appends (main thread only)
@@ -784,6 +815,7 @@ namespace helpers
 	static void FreezeProgressOnCancel(AppState* st);
 	static bool GateProgressUpdate(AppState* st);
 
+	static void UpdateStatusBarText(AppState* st, std::wstring_view text);
 	static void SetUiForWorkerRunning(AppState* st, bool running);
 	static void SetProgressVisible(AppState* st, bool visible);
 	static void SetStatusText(AppState* st, std::wstring_view text);
@@ -797,6 +829,7 @@ namespace helpers
 
 	static void UpdateLogActionButtonsEnabled(AppState* st);
 	static void UpdateCheckUpdatesButtonEnabled(AppState* st);
+	static void UpdateChangeLogButtonEnabled(AppState* st);
 	static void UpdateHelpButtonEnabled(AppState* st);
 
 	struct ProgressUpdate;
@@ -989,6 +1022,13 @@ namespace helpers
 		EnableWindow(st->hCheckUpdatesBtn, enable ? TRUE : FALSE);
 	}
 
+	static void UpdateChangeLogButtonEnabled(AppState* st)
+	{
+		if (!st || !st->hChangeLogBtn) return;
+		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
+		EnableWindow(st->hChangeLogBtn, enable ? TRUE : FALSE);
+	}
+
 	static void UpdateHelpButtonEnabled(AppState* st)
 	{
 		if (!st || !st->hHelpBtn) return;
@@ -1032,6 +1072,13 @@ namespace helpers
 		return out;
 	}
 
+	static void UpdateStatusBarText(AppState* st, std::wstring_view text)
+	{
+		if (!st || !st->hStatusBar) return;
+		std::wstring tmp(text);
+		SendMessageW(st->hStatusBar, SB_SETTEXTW, 0, (LPARAM)tmp.c_str());
+	}
+
 	static void SetUiForWorkerRunning(AppState* st, bool running)
 	{
 		if (!st) return;
@@ -1041,7 +1088,11 @@ namespace helpers
 		EnableCtl(st->hRunButton, !running);
 		EnableCtl(st->hDeleteBtn, !running);
 		EnableCtl(st->hFolderEdit, !running);
-		if (running) EnableCtl(st->hHelpBtn, false);
+		if (running)
+		{
+			EnableCtl(st->hHelpBtn, false);
+			EnableCtl(st->hAboutBtn, false);
+		}
 
 		// These buttons have additional logic (log empty / update thread), but they must be disabled while running.
 		// We hard-disable them here when running; when idle we defer to the existing helper logic.
@@ -1050,12 +1101,15 @@ namespace helpers
 			EnableCtl(st->hCopyLogBtn, false);
 			EnableCtl(st->hSaveLogBtn, false);
 			EnableCtl(st->hCheckUpdatesBtn, false);
+			EnableCtl(st->hChangeLogBtn, false);
 		}
 		else
 		{
 			UpdateLogActionButtonsEnabled(st);
 			UpdateCheckUpdatesButtonEnabled(st);
+			UpdateChangeLogButtonEnabled(st);
 			UpdateHelpButtonEnabled(st);
+			EnableCtl(st->hAboutBtn, true);
 		}
 
 		// Cancel is the inverse (only enabled while running).
@@ -1160,17 +1214,20 @@ namespace helpers
 		{
 		case UiMode::Idle:
 			SetUiForWorkerRunning(st, false);
+			UpdateStatusBarText(st, L"Ready");
 			// Leave progress controls visible; keep last message unless caller changes it.
 			SetProgressMarquee(st, false);
 			break;
 		case UiMode::Running:
 			SetUiForWorkerRunning(st, true);
+			UpdateStatusBarText(st, L"Working...");
 			SetProgressVisible(st, true);
 			break;
 		case UiMode::Canceling:
 			// Cancel has been requested; prevent repeat clicks but keep worker running.
 			SetUiForWorkerRunning(st, true);
 			EnableCtl(st->hCancelBtn, false);
+			UpdateStatusBarText(st, L"Canceling...");
 			break;
 		}
 	}
@@ -1496,6 +1553,144 @@ static std::wstring Utf8ToWide(const std::string& s)
 	return out;
 }
 
+static bool CopyWideTextToClipboard(HWND owner, const std::wstring& text, std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+
+	if (!OpenClipboard(owner))
+	{
+		if (outErr) *outErr = L"Failed to open clipboard: " + Win32ErrorMessage(GetLastError());
+		return false;
+	}
+
+	EmptyClipboard();
+
+	const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+	if (!hMem)
+	{
+		DWORD err = GetLastError();
+		CloseClipboard();
+		if (outErr) *outErr = L"Failed to allocate clipboard memory: " + Win32ErrorMessage(err);
+		return false;
+	}
+
+	void* pMem = GlobalLock(hMem);
+	if (!pMem)
+	{
+		DWORD err = GetLastError();
+		GlobalFree(hMem);
+		CloseClipboard();
+		if (outErr) *outErr = L"Failed to lock clipboard memory: " + Win32ErrorMessage(err);
+		return false;
+	}
+
+	memcpy(pMem, text.c_str(), bytes);
+	GlobalUnlock(hMem);
+
+	if (!SetClipboardData(CF_UNICODETEXT, hMem))
+	{
+		DWORD err = GetLastError();
+		GlobalFree(hMem);
+		CloseClipboard();
+		if (outErr) *outErr = L"Failed to set clipboard data: " + Win32ErrorMessage(err);
+		return false;
+	}
+
+	// Clipboard owns hMem after SetClipboardData succeeds.
+	CloseClipboard();
+	return true;
+}
+
+static std::wstring BuildAboutSystemInfoText()
+{
+	std::wstring info;
+
+	info += L"MapPack Sync Tool\r\n";
+	info += L"Version: " + GetDisplayVersion() + L"\r\n\r\n";
+
+	fs::path exePath = GetThisExePath();
+	info += L"Executable Path:\r\n";
+	info += exePath.empty() ? L"(unknown)" : exePath.wstring();
+	info += L"\r\n\r\n";
+
+	info += L"Application Directory:\r\n";
+	fs::path appDir;
+	std::wstring appDirErr;
+	if (GetApplicationDirectory(appDir, &appDirErr))
+		info += appDir.wstring();
+	else
+		info += L"(error) " + appDirErr;
+	info += L"\r\n\r\n";
+
+	info += L"Settings INI:\r\n";
+	info += GetSettingsIniPath();
+	info += L"\r\n\r\n";
+
+	info += L"Elevation:\r\n";
+	info += IsCurrentProcessElevated() ? L"Administrator" : L"Standard user";
+	info += L"\r\n\r\n";
+
+	info += L"Selected Istaria Folder:\r\n";
+	if (g_state && g_state->hFolderEdit)
+	{
+		int len = GetWindowTextLengthW(g_state->hFolderEdit);
+		if (len > 0)
+		{
+			std::wstring folder((size_t)len + 1, L'\0');
+			GetWindowTextW(g_state->hFolderEdit, folder.data(), len + 1);
+			folder.resize(wcslen(folder.c_str()));
+			info += folder.empty() ? L"(none selected)" : folder;
+		}
+		else
+		{
+			info += L"(none selected)";
+		}
+	}
+	else
+	{
+		info += L"(window not ready)";
+	}
+	info += L"\r\n\r\n";
+
+	info += L"Remote Host:\r\n";
+	info += Utf8ToWide(kRemoteHost);
+	info += L"\r\n\r\n";
+
+	info += L"Remote Manifest:\r\n";
+	info += Utf8ToWide(std::string(kRemoteHost) + kManifestPath);
+	info += L"\r\n\r\n";
+
+	info += L"Update Version URL:\r\n";
+	info += kUpdateVersionUrl;
+	info += L"\r\n\r\n";
+
+	info += L"Process ID:\r\n";
+	info += std::to_wstring(GetCurrentProcessId());
+	info += L"\r\n";
+
+	return info;
+}
+
+static void ShowAboutSystemInfoDialog(HWND owner)
+{
+	std::wstring info = BuildAboutSystemInfoText();
+
+	AppState* st = g_state;
+	if (!st || !st->hOutput)
+	{
+		MessageBoxW(owner, L"Output window is not available.", L"About / System Info", MB_OK | MB_ICONERROR);
+		return;
+	}
+
+	OutputSetTextW(st, NormalizeToWindowsNewlines(info), true);
+	st->logActionsArmed = true;
+	UpdateLogActionButtonsEnabled(st);
+	UpdateHelpButtonEnabled(st);
+	SetStatusText(st, L"Viewing About / System Info. Use Copy Log or Save Log if needed.");
+}
+
+
 static bool TryUtf8ToWideStrict(const char* data, size_t size, std::wstring& out)
 {
 	out.clear();
@@ -1791,7 +1986,7 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 	r.ok = true;
 	return r;
 }
-static bool CanWriteClientPrefsArea(const fs::path& localBase, std::wstring* outErr)
+static bool CanWriteToSelectedClientPrefsFolder(const fs::path& localBase, std::wstring* outErr)
 {
 	fs::path prefsDir = localBase / L"prefs";
 	if (!EnsureDirectoryExistsForWrite(prefsDir, outErr))
@@ -1799,58 +1994,128 @@ static bool CanWriteClientPrefsArea(const fs::path& localBase, std::wstring* out
 	return CanCreateAndDeleteTempFileInDirectory(prefsDir, outErr);
 }
 
-static bool CanWriteSyncArea(const fs::path& localSyncRoot, std::wstring* outErr)
+static bool CanWriteToSelectedMappackFolder(const fs::path& localSyncRoot, std::wstring* outErr)
 {
 	if (!EnsureDirectoryExistsForWrite(localSyncRoot, outErr))
 		return false;
 	return CanCreateAndDeleteTempFileInDirectory(localSyncRoot, outErr);
 }
 
-static bool CanWriteApplicationDirectory(std::wstring* outErr)
+static bool CanWriteToApplicationDirectory(std::wstring* outErr)
 {
-	fs::path exePath = GetThisExePath();
-	if (exePath.empty())
-	{
-		if (outErr) *outErr = L"Could not determine the application path.";
+	fs::path appDir;
+	if (!GetApplicationDirectory(appDir, outErr))
 		return false;
-	}
-
-	fs::path appDir = exePath.parent_path();
 	if (!EnsureDirectoryExistsForWrite(appDir, outErr))
 		return false;
 	return CanCreateAndDeleteTempFileInDirectory(appDir, outErr);
 }
 
-static bool EnsureUpdateAccessOrRelaunch(HWND owner)
+static bool EnsureWriteAccessOrPromptElevation(
+	HWND owner,
+	const std::vector<std::function<bool(std::wstring*)>>& writeChecks,
+	const std::wstring& alreadyElevatedMessagePrefix,
+	const std::wstring& elevationPromptPrefix,
+	const std::wstring& relaunchParameters,
+	const std::wstring& alreadyElevatedResolutionText = L"Please adjust permissions or move the affected files to a writable location.")
 {
 	std::wstring writeErr;
-	if (CanWriteApplicationDirectory(&writeErr) && CanWriteSettingsIni(&writeErr))
+	for (const auto& check : writeChecks)
+	{
+		if (!check)
+			continue;
+
+		std::wstring thisErr;
+		if (!check(&thisErr))
+		{
+			writeErr = thisErr;
+			break;
+		}
+	}
+
+	if (writeErr.empty())
 		return true;
 
 	if (IsCurrentProcessElevated())
 	{
-		std::wstring msg =
-			L"The application folder or settings location still is not writable.\r\n\r\n" +
-			writeErr +
-			L"\r\n\r\nPlease adjust permissions or move the application to a writable location.";
+		std::wstring msg = alreadyElevatedMessagePrefix;
+		if (!msg.empty())
+			msg += L"\r\n\r\n";
+		msg += writeErr;
+		msg += L"\r\n\r\n" + alreadyElevatedResolutionText;
 		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 		return false;
 	}
 
-	std::wstring msg =
-		L"Administrator rights are required to update MapPack Sync Tool or write MapPackSyncTool.ini in the current location.\r\n\r\n" +
-		writeErr +
-		L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
+	std::wstring msg = elevationPromptPrefix;
+	if (!msg.empty())
+		msg += L"\r\n\r\n";
+	msg += writeErr;
+	msg += L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
+
 	if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
 	{
-		if (RelaunchSelfElevated(owner, L"--auto-update"))
+		ReleaseSingleInstanceMutex();
+		if (RelaunchSelfElevated(owner, relaunchParameters))
 		{
 			PostMessageW(owner, WM_CLOSE, 0, 0);
 			return false;
 		}
 		MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 	}
+
 	return false;
+}
+
+static bool EnsureUpdateWriteAccessOrPromptElevation(HWND owner)
+{
+	return EnsureWriteAccessOrPromptElevation(
+		owner,
+		{
+			[](std::wstring* err) { return CanWriteToApplicationDirectory(err); },
+			[](std::wstring* err) { return CanWriteToSettingsIniLocation(err); }
+		},
+		L"The application folder or settings location still is not writable.",
+		L"Administrator rights are required to update MapPack Sync Tool or write MapPackSyncTool.ini in the current location.",
+		L"--auto-update",
+		L"Please adjust permissions or move the application to a writable location.");
+}
+
+static bool EnsureAppDirectoryWriteAccessOrPromptElevation(HWND owner, const wchar_t* operationDescription, const wchar_t* relaunchParameters)
+{
+	const std::wstring op = (operationDescription && *operationDescription)
+		? std::wstring(operationDescription)
+		: std::wstring(L"write files in the application folder");
+
+	return EnsureWriteAccessOrPromptElevation(
+		owner,
+		{ [](std::wstring* err) { return CanWriteToApplicationDirectory(err); } },
+		L"The application folder is not writable, so MapPack Sync Tool cannot " + op + L".",
+		L"Administrator rights are required to " + op + L" in the current application folder.",
+		(relaunchParameters && *relaunchParameters) ? std::wstring(relaunchParameters) : std::wstring(),
+		L"Please adjust permissions or move the application to a writable location.");
+}
+
+static bool EnsureSelectedGameFolderWriteAccessOrPromptElevation(HWND owner, const std::wstring& folderWs, WorkerKind kind)
+{
+	PreflightResult pf = ValidateFolderSelection(folderWs);
+	if (!pf.ok)
+		return true;
+
+	const wchar_t* opName = (kind == WorkerKind::Remove) ? L"remove MapPack files" : L"sync MapPack files";
+	std::wstring args = (kind == WorkerKind::Remove) ? L"--auto-remove " : L"--auto-sync ";
+	args += QuoteCommandLineArg(folderWs);
+
+	return EnsureWriteAccessOrPromptElevation(
+		owner,
+		{
+			[localSyncRoot = pf.localSyncRoot] (std::wstring* err) { return CanWriteToSelectedMappackFolder(localSyncRoot, err); },
+			[localBase = pf.localBase](std::wstring* err) { return CanWriteToSelectedClientPrefsFolder(localBase, err); }
+		},
+		L"The selected Istaria folder still is not writable.",
+			L"The selected Istaria folder requires administrator rights to " + std::wstring(opName) + L".",
+			args,
+			L"Please choose a writable game folder or adjust permissions.");
 }
 
 static bool DownloadUrlToFileNoVerify(
@@ -1859,6 +2124,62 @@ static bool DownloadUrlToFileNoVerify(
 	const CancelToken& cancel,
 	std::string* outErr,
 	long* outHttp);
+static bool MoveReplace(const fs::path& from, const fs::path& to);
+
+static bool AreFilesByteIdentical(const fs::path& a, const fs::path& b, std::wstring* outErr = nullptr)
+{
+	if (outErr) outErr->clear();
+
+	std::error_code ec;
+	if (!fs::exists(a, ec) || ec || !fs::exists(b, ec) || ec)
+		return false;
+
+	const uintmax_t sizeA = fs::file_size(a, ec);
+	if (ec)
+	{
+		if (outErr) *outErr = L"Could not read file size for '" + a.wstring() + L"': " + Utf8ToWide(ec.message());
+		return false;
+	}
+
+	const uintmax_t sizeB = fs::file_size(b, ec);
+	if (ec)
+	{
+		if (outErr) *outErr = L"Could not read file size for '" + b.wstring() + L"': " + Utf8ToWide(ec.message());
+		return false;
+	}
+
+	if (sizeA != sizeB)
+		return false;
+
+	std::ifstream fa(a, std::ios::binary);
+	std::ifstream fb(b, std::ios::binary);
+	if (!fa || !fb)
+	{
+		if (outErr) *outErr = L"Could not open files for comparison.";
+		return false;
+	}
+
+	constexpr size_t kBufSize = 64 * 1024;
+	std::vector<char> ba(kBufSize);
+	std::vector<char> bb(kBufSize);
+
+	while (fa && fb)
+	{
+		fa.read(ba.data(), (std::streamsize)ba.size());
+		fb.read(bb.data(), (std::streamsize)bb.size());
+
+		const std::streamsize na = fa.gcount();
+		const std::streamsize nb = fb.gcount();
+		if (na != nb)
+			return false;
+		if (na <= 0)
+			break;
+		if (std::memcmp(ba.data(), bb.data(), (size_t)na) != 0)
+			return false;
+	}
+
+	return true;
+}
 
 struct StartupSupportFile
 {
@@ -1867,19 +2188,67 @@ struct StartupSupportFile
 	bool required;
 };
 
-static bool DownloadStartupSupportFile(const StartupSupportFile& file, const fs::path& appDir, std::wstring* outErr)
+static bool GetApplicationDirectory(fs::path& outAppDir, std::wstring* outErr)
 {
+	outAppDir.clear();
 	if (outErr) outErr->clear();
 
-	const std::string url = std::string(kRemoteHost) + file.remotePath;
-	const fs::path dest = appDir / file.localName;
+	fs::path exePath = GetThisExePath();
+	if (!exePath.empty())
+	{
+		outAppDir = exePath.parent_path();
+		return true;
+	}
+
+	std::error_code ec;
+	outAppDir = fs::current_path(ec);
+	if (ec)
+	{
+		if (outErr) *outErr = L"Could not determine the application folder.\r\n\r\n" + Utf8ToWide(ec.message());
+		return false;
+	}
+	return true;
+}
+
+static bool DownloadRemoteAppFilePreserveTimestamp(
+	const char* remotePath,
+	const wchar_t* localName,
+	const wchar_t* tempSuffix,
+	std::wstring* outErr)
+{
+	if (outErr) outErr->clear();
+	if (!remotePath || !*remotePath || !localName || !*localName)
+	{
+		if (outErr) *outErr = L"Internal error: invalid download target.";
+		return false;
+	}
+
+	fs::path appDir;
+	if (!GetApplicationDirectory(appDir, outErr))
+		return false;
+
+	const std::string url = std::string(kRemoteHost) + remotePath;
+	const fs::path dest = appDir / localName;
+	fs::path downloaded = dest;
+	downloaded += (tempSuffix && *tempSuffix) ? tempSuffix : L".download";
+
+	std::error_code ec;
+	fs::remove(downloaded, ec);
+	ec.clear();
+
 	CancelToken noCancel{};
 	std::string dlErr;
 	long http = 0;
 
-	if (!DownloadUrlToFileNoVerify(url, dest, noCancel, &dlErr, &http))
+	// Always download to a side file first. If the downloaded bytes match the
+	// existing local file, delete the side file and leave the local modified time
+	// untouched. Only replace the local file when the content actually changes.
+	// This will preserve file date/time so it doesn't look like we have a new updates,
+	// to help/support/changelog files everytime program is ran.
+	if (!DownloadUrlToFileNoVerify(url, downloaded, noCancel, &dlErr, &http))
 	{
-		std::wstring msg = L"Failed to download " + std::wstring(file.localName) + L".";
+		fs::remove(downloaded, ec);
+		std::wstring msg = L"Failed to download " + std::wstring(localName) + L".";
 		if (http != 0)
 			msg += L"\r\nHTTP status: " + std::to_wstring(http);
 		if (!dlErr.empty())
@@ -1888,72 +2257,46 @@ static bool DownloadStartupSupportFile(const StartupSupportFile& file, const fs:
 		return false;
 	}
 
+	std::wstring compareErr;
+	if (AreFilesByteIdentical(dest, downloaded, &compareErr))
+	{
+		fs::remove(downloaded, ec);
+		return true;
+	}
+
+	if (!MoveReplace(downloaded, dest))
+	{
+		DWORD err = GetLastError();
+		fs::remove(downloaded, ec);
+		std::wstring msg = L"Failed to replace " + std::wstring(localName) + L".";
+		msg += L"\r\n" + Win32ErrorMessage(err);
+		if (!compareErr.empty())
+			msg += L"\r\n\r\nComparison detail: " + compareErr;
+		if (outErr) *outErr = msg;
+		return false;
+	}
+
 	return true;
 }
 
-static bool EnsureStartupSupportFilesAccessOrRelaunch(HWND owner)
-{
-	std::wstring writeErr;
-	if (CanWriteApplicationDirectory(&writeErr))
-		return true;
-
-	if (IsCurrentProcessElevated())
-	{
-		std::wstring msg =
-			L"The application folder is not writable, so startup support files could not be refreshed.\r\n\r\n" +
-			writeErr +
-			L"\r\n\r\nPlease adjust permissions or move the application to a writable location.";
-		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-		return false;
-	}
-
-	std::wstring msg =
-		L"MapPack Sync Tool needs to refresh its support files in the application folder.\r\n\r\n" +
-		writeErr +
-		L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
-	if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
-	{
-		// Preserve any startup arguments, such as --auto-sync/--auto-remove/--auto-update.
-		// Release the single-instance mutex before launching the elevated copy so the
-		// elevated process is not mistaken for a second instance and immediately closed.
-		std::wstring args = BuildCurrentCommandLineArgumentsForRelaunch();
-		ReleaseSingleInstanceMutex();
-		if (RelaunchSelfElevated(owner, args))
-			return false;
-		MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-	}
-	return false;
-}
 
 static bool RefreshStartupSupportFiles(HWND owner)
 {
-	if (!EnsureStartupSupportFilesAccessOrRelaunch(owner))
+	std::wstring relaunchArgs = BuildCurrentCommandLineArgumentsForRelaunch();
+	if (!EnsureAppDirectoryWriteAccessOrPromptElevation(
+		owner,
+		L"refresh startup support files",
+		relaunchArgs.c_str()))
+	{
 		return false;
-
-	fs::path exePath = GetThisExePath();
-	fs::path appDir;
-	if (!exePath.empty())
-	{
-		appDir = exePath.parent_path();
-	}
-	else
-	{
-		std::error_code ec;
-		appDir = fs::current_path(ec);
-		if (ec)
-		{
-			std::wstring msg = L"Could not determine the application folder.\r\n\r\n" + Utf8ToWide(ec.message());
-			MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-			return false;
-		}
 	}
 
 	const StartupSupportFile files[] =
 	{
-		{ kSupportFileHelpPath, L"MapPackSyncTool_Help.txt", true },
-		{ kSupportFileTermsPath, kTermsFileName, true },
-		{ kSupportFileReadmeDocxPath, L"README.docx", false },
-		{ kSupportFileReadmeRtfPath, L"README.rtf", false },
+		{ kRemoteSupportHelpPath, L"MapPackSyncTool_Help.txt", true },
+		{ kRemoteSupportTermsPath, kLocalTermsFileName, true },
+		{ kRemoteSupportReadmeDocxPath, L"README.docx", false },
+		{ kRemoteSupportReadmeRtfPath, L"README.rtf", false },
 	};
 
 	std::wstring requiredErrors;
@@ -1962,7 +2305,7 @@ static bool RefreshStartupSupportFiles(HWND owner)
 	for (const StartupSupportFile& file : files)
 	{
 		std::wstring err;
-		if (!DownloadStartupSupportFile(file, appDir, &err))
+		if (!DownloadRemoteAppFilePreserveTimestamp(file.remotePath, file.localName, L".startup-download", &err))
 		{
 			if (file.required)
 			{
@@ -1996,46 +2339,6 @@ static bool RefreshStartupSupportFiles(HWND owner)
 		MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONWARNING);
 	}
 
-	return true;
-}
-
-static bool EnsureOperationAccessOrRelaunch(HWND owner, const std::wstring& folderWs, WorkerKind kind)
-{
-	PreflightResult pf = ValidateFolderSelection(folderWs);
-	if (!pf.ok)
-		return true;
-
-	std::wstring writeErr;
-	if (!CanWriteSyncArea(pf.localSyncRoot, &writeErr) || !CanWriteClientPrefsArea(pf.localBase, &writeErr))
-	{
-		if (IsCurrentProcessElevated())
-		{
-			std::wstring msg =
-				L"The selected Istaria folder still is not writable.\r\n\r\n" +
-				writeErr +
-				L"\r\n\r\nPlease choose a writable game folder or adjust permissions.";
-			MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-			return false;
-		}
-
-		const wchar_t* opName = (kind == WorkerKind::Remove) ? L"remove MapPack files" : L"sync MapPack files";
-		std::wstring msg =
-			L"The selected Istaria folder requires administrator rights to " + std::wstring(opName) + L".\r\n\r\n" +
-			writeErr +
-			L"\r\n\r\nDo you want to restart MapPack Sync Tool as administrator and continue?";
-		if (MessageBoxW(owner, msg.c_str(), L"MapPack Sync Tool", MB_YESNO | MB_ICONQUESTION) == IDYES)
-		{
-			std::wstring args = (kind == WorkerKind::Remove) ? L"--auto-remove " : L"--auto-sync ";
-			args += QuoteCommandLineArg(folderWs);
-			if (RelaunchSelfElevated(owner, args))
-			{
-				PostMessageW(owner, WM_CLOSE, 0, 0);
-				return false;
-			}
-			MessageBoxW(owner, L"Failed to restart the application as administrator.", L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
-		}
-		return false;
-	}
 	return true;
 }
 
@@ -3608,7 +3911,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 {
 	if (cancel.IsCanceled()) return;
 	LogSeparator();
-	Log("Downloading manifest for old MapPack 4.0 and earlier versions... ");
+	Log("Downloading manifest for old MapPack 4.0 and earlier versions ... ");
 
 	const std::string url = JoinUrl(cfg.remoteHost, kManifestOldPath);
 	std::string jsonText;
@@ -3627,7 +3930,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		return;
 	}
 
-	Log("Success!\r\n\r\n");
+	Log("Success!\r\n");
 	LogSeparator();
 
 	Log("Parsing and removing files from old MapPack 4.0...\r\n");
@@ -3751,7 +4054,7 @@ static bool DownloadAndParseManifest(const SyncConfig& cfg, ManifestData& out, s
 	Log("Downloading MapPack 5.0 manifest... ");
 
 	PostProgressMarqueeOn();
-	PostProgressTextW(L"Downloading manifest...");
+	PostProgressTextW(L"Downloading manifest ...");
 	std::string manifestText;
 	std::string dlErr; long http = 0;
 	if (!DownloadUrl(cfg.manifestUrl, manifestText, cancel, &dlErr, &http))
@@ -3892,7 +4195,7 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 	if (cancel.IsCanceled()) return;
 	if (!anyChanged)
 		Log("  No missing or changed files found. Your files are in sync with the manifest!\r\n");
-	PostProgressTextW(L"Sync complete.");
+	PostProgressTextW(L"Sync complete");
 }
 static void LogSummaryAndCleanup(const SyncConfig& cfg, const SyncCounters& c, const CancelToken& cancel)
 {
@@ -3942,7 +4245,7 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
 
 	if (removedDirs == 0)
-		Log("  No empty sub-directories found; Nothing  to delete.\r\n");
+		Log("  No empty sub-directories found; Nothing to delete.\r\n");
 	else
 		Log("\r\nEmpty Directory Removal Summary:\r\n");
 	//	Log("  Directories removed: " + std::to_string(removedDirs) + "\r\n");
@@ -3953,7 +4256,7 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 	EnsureClientPrefsMapPath(cfg, cancel);
 	if (IsCanceledNoNotify(cancel)) return;
 	LogSeparator();
-	Log("Sync complete.");
+	Log("Sync complete");
 }
 
 
@@ -5073,6 +5376,7 @@ static void StartCheckForUpdates(bool quietIfNoUpdate = false)
 	if (!st) return;
 	if (st->isUpdateRunning.exchange(true)) return;
 	UpdateCheckUpdatesButtonEnabled(st);
+	UpdateChangeLogButtonEnabled(st);
 
 	UpdateResult* res = new UpdateResult();
 	res->quietIfNoUpdate = quietIfNoUpdate;
@@ -5081,6 +5385,7 @@ static void StartCheckForUpdates(bool quietIfNoUpdate = false)
 	{
 		st->isUpdateRunning.store(false);
 		UpdateCheckUpdatesButtonEnabled(st);
+		UpdateChangeLogButtonEnabled(st);
 		delete res;
 		if (!quietIfNoUpdate)
 			Log("ERROR: Failed to start update thread.\r\n");
@@ -5300,7 +5605,7 @@ static bool EnsureTermsAccepted(HWND parent)
 		return true;
 
 	fs::path exePath = GetThisExePath();
-	fs::path termsPath = exePath.empty() ? fs::path(kTermsFileName) : (exePath.parent_path() / kTermsFileName);
+	fs::path termsPath = exePath.empty() ? fs::path(kLocalTermsFileName) : (exePath.parent_path() / kLocalTermsFileName);
 
 	std::wstring termsText;
 	std::wstring err;
@@ -5376,6 +5681,74 @@ static LRESULT HandleWmGetMinMaxInfo(HWND hwnd, LPARAM lParam)
 	return 0;
 }
 
+
+static bool LoadRemoteChangeLogIntoOutput(AppState* st)
+{
+	if (!st || !st->hMainWnd || !st->hOutput)
+		return false;
+
+	// changelog.txt is cached next to the EXE, and the timestamp-preserve path
+	// creates a temporary side file before replacing the real file only when
+	// content changes. Gate that temp-file write through the same elevation style
+	// used elsewhere instead of failing later during download/replace.
+	if (!EnsureAppDirectoryWriteAccessOrPromptElevation(
+		st->hMainWnd,
+		L"download and cache the Change Log",
+		L"--auto-changelog"))
+	{
+		return false;
+	}
+
+	std::string urlUtf8 = std::string(kRemoteHost) + kRemoteChangeLogFilePath;
+	std::wstring urlW = Utf8ToWide(urlUtf8);
+	std::wstring err;
+
+	ClearOutput(st);
+	SetStatusText(st, L"Checking latest version of Change Log...");
+	EnableCtl(st->hChangeLogBtn, false);
+	HCURSOR oldCursor = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+	const bool downloaded = DownloadRemoteAppFilePreserveTimestamp(
+		kRemoteChangeLogFilePath,
+		L"changelog.txt",
+		L".changelog-download",
+		&err);
+	SetCursor(oldCursor);
+	UpdateChangeLogButtonEnabled(st);
+	if (!downloaded)
+	{
+		SetStatusText(st, L"Failed to load Change Log.");
+		std::wstring msg = L"Failed to download Change Log:\r\n\r\n" + err + L"\r\n\r\nURL:\r\n" + urlW;
+		MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	fs::path appDir;
+	if (!GetApplicationDirectory(appDir, &err))
+	{
+		SetStatusText(st, L"Failed to load Change Log.");
+		MessageBoxW(st->hMainWnd, err.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	std::wstring textW;
+	if (!ReadUtf8TextFileStrict(appDir / L"changelog.txt", textW, &err))
+	{
+		SetStatusText(st, L"Failed to load Change Log.");
+		MessageBoxW(st->hMainWnd, err.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	if (textW.empty())
+		textW = L"Change Log is empty.";
+
+	OutputSetTextW(st, NormalizeToWindowsNewlines(textW), true);
+	st->logActionsArmed = true;
+	UpdateLogActionButtonsEnabled(st);
+	UpdateHelpButtonEnabled(st);
+	SetStatusText(st, L"Viewing latest changelog.txt.  Note this file can also be found in MapPack Sync Tool folder.");
+	return true;
+}
+
 static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
 {
 
@@ -5413,7 +5786,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		std::wstring folder = GetTextCtl(st->hFolderEdit);
 		TrimInPlace(folder);
 		StripSurroundingQuotes(folder);
-		if (!EnsureOperationAccessOrRelaunch(hwnd, folder, WorkerKind::Sync))
+		if (!EnsureSelectedGameFolderWriteAccessOrPromptElevation(hwnd, folder, WorkerKind::Sync))
 			return 0;
 		StartSyncIfNotRunning();
 	}
@@ -5448,7 +5821,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		std::wstring folder = GetTextCtl(st->hFolderEdit);
 		TrimInPlace(folder);
 		StripSurroundingQuotes(folder);
-		if (!EnsureOperationAccessOrRelaunch(hwnd, folder, WorkerKind::Remove))
+		if (!EnsureSelectedGameFolderWriteAccessOrPromptElevation(hwnd, folder, WorkerKind::Remove))
 			return 0;
 		StartRemoveIfNotRunning();
 	}
@@ -5462,9 +5835,37 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	}
 	else if ((HWND)lParam == st->hCheckUpdatesBtn)
 	{
-		if (!EnsureUpdateAccessOrRelaunch(hwnd))
+		if (!EnsureUpdateWriteAccessOrPromptElevation(hwnd))
 			return 0;
 		StartCheckForUpdates(false);
+	}
+	else if ((HWND)lParam == st->hChangeLogBtn)
+	{
+		MessageBeep(MB_ICONASTERISK);
+		const int r = MessageBoxW(
+			hwnd,
+			L"Clear Log and Load Change Log?",
+			L"MapPack Sync Tool",
+			MB_OKCANCEL | MB_ICONQUESTION
+		);
+		if (r == IDOK)
+		{
+			LoadRemoteChangeLogIntoOutput(st);
+		}
+	}
+	else if ((HWND)lParam == st->hAboutBtn)
+	{
+		MessageBeep(MB_ICONASTERISK);
+		const int r = MessageBoxW(
+			hwnd,
+			L"Clear Log and Load About / System Info?",
+			L"MapPack Sync Tool",
+			MB_OKCANCEL | MB_ICONQUESTION
+		);
+		if (r == IDOK)
+		{
+			ShowAboutSystemInfoDialog(hwnd);
+		}
 	}
 	else if ((HWND)lParam == st->hHelpBtn)
 	{
@@ -5481,6 +5882,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			UpdateHelpButtonEnabled(st);
 			// Clear then load MapPackSyncTool_Help.txt into the log.
 			LoadHelpTextIntoOutput(true, true);
+			SetStatusText(st, L"Ready");
 		}
 	}
 
@@ -5496,6 +5898,7 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 		{
 			st->isUpdateRunning.store(false);
 			UpdateCheckUpdatesButtonEnabled(st);
+			UpdateChangeLogButtonEnabled(st);
 			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
 		}
 
@@ -5514,15 +5917,15 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 		{
 			if (!quietIfNoUpdate)
 			{
-				std::wstring msg = L"You are already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable Version: v" + res->remoteVersion;
-				MessageBoxW(hwnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
+				std::wstring msg = L"You already have the latest version.\r\n\r\nCurrent version: v" + res->localVersion;
+				MessageBoxW(hwnd, msg.c_str(), L"Checking for newer versions of MapPack Sync Tool", MB_OK | MB_ICONINFORMATION);
 			}
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
 		}
 		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick OK to proceed with the update.";
-		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for Updates...", MB_OKCANCEL | MB_ICONINFORMATION);
-		if (r != IDOK)
+		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for newer versions of MapPack Sync Tool", MB_YESNO | MB_ICONINFORMATION);
+		if (r != IDYES)
 		{
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
@@ -5719,6 +6122,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	{
 		g_pendingAutoAction = PendingAutoAction::Update;
 	}
+	else if (argv && argc >= 2 && _wcsicmp(argv[1], L"--auto-changelog") == 0)
+	{
+		g_pendingAutoAction = PendingAutoAction::ChangeLog;
+	}
 	if (argv) LocalFree(argv);
 	// Enforce single instance for normal GUI mode.
 	if (!AcquireSingleInstanceMutex())
@@ -5769,44 +6176,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	ShowWindow(g_state->hMainWnd, SW_SHOW);
 	UpdateWindow(g_state->hMainWnd);
 
-	// Startup support files are refreshed before the main controls are created.
-	// Show a temporary status so the first launch does not look like a blank/hung window.
-	SetWindowTextW(g_state->hMainWnd, L"MapPack Sync Tool - Checking for Help/Support files updates...");
-	HWND hStartupStatus = CreateWindowW(
-		L"STATIC",
-		L"Checking for Help/Support files updates...",
-		WS_CHILD | WS_VISIBLE | SS_CENTER,
-		0, (MAIN_WINDOW_HEIGHT / 2) - 20, MAIN_WINDOW_WIDTH, 20,
-		g_state->hMainWnd, nullptr, hInst, nullptr);
-	if (hStartupStatus && g_state->hFontUI)
-		SendMessageW(hStartupStatus, WM_SETFONT, (WPARAM)g_state->hFontUI, TRUE);
-	UpdateWindow(g_state->hMainWnd);
-	if (hStartupStatus)
-		UpdateWindow(hStartupStatus);
-
-	if (!RefreshStartupSupportFiles(g_state->hMainWnd))
-	{
-		if (hStartupStatus) DestroyWindow(hStartupStatus);
-		SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
-		DestroyWindow(g_state->hMainWnd);
-		ReleaseSingleInstanceMutex();
-		return 0;
-	}
-
-	if (hStartupStatus)
-	{
-		DestroyWindow(hStartupStatus);
-		hStartupStatus = nullptr;
-	}
-	SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
-	UpdateWindow(g_state->hMainWnd);
-
-	if (!EnsureTermsAccepted(g_state->hMainWnd))
-	{
-		DestroyWindow(g_state->hMainWnd);
-		ReleaseSingleInstanceMutex();
-		return 0;
-	}
+	// Main controls are created before startup support-file refresh so the user sees
+	// the normal UI immediately. The RichEdit box will show startup status text while
+	// MapPackSyncTool_Help.txt, MapPackSyncTool_Terms.txt, README.docx, and README.rtf
+	// are refreshed/verified.
 	g_state->hFolderLabel = CreateWindowW(L"STATIC", L"Istaria Root Game Folder:", WS_CHILD | WS_VISIBLE,
 		10, 15, 170, 20, g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hFolderEdit = CreateWindowW(
@@ -5869,8 +6242,18 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 		0, 0, 130, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
+	g_state->hChangeLogBtn = CreateWindowW(
+		L"BUTTON", L"Change Log",
+		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+		0, 0, 92, 22,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hHelpBtn = CreateWindowW(
 		L"BUTTON", L"?",
+		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+		0, 0, 22, 22,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
+	g_state->hAboutBtn = CreateWindowW(
+		L"BUTTON", L"i",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 		0, 0, 22, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
@@ -5898,8 +6281,22 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	UpdateLogActionButtonsEnabled(g_state);
 	UpdateHelpButtonEnabled(g_state);
-	// On startup, load MapPackSyncTool_Help.txt (if present) into the log.
-	LoadHelpTextIntoOutput(true, false);
+	// --------------------------------------------------
+	// Status bar
+	// --------------------------------------------------
+	g_state->hStatusBar = CreateWindowExW(
+		0,
+		STATUSCLASSNAMEW,
+		L"Ready",
+		WS_CHILD | WS_VISIBLE,
+		0, 0, 0, 0,
+		g_state->hMainWnd,
+		nullptr,
+		hInst,
+		nullptr);
+	if (g_state->hStatusBar && g_state->hFontUI)
+		SendMessageW(g_state->hStatusBar, WM_SETFONT, (WPARAM)g_state->hFontUI, TRUE);
+
 	// --------------------------------------------------
 	// Tooltips
 	// --------------------------------------------------
@@ -5922,7 +6319,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		// reduce hang-time a bit
 		SendMessageW(g_state->hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 4000);
 		SendMessageW(g_state->hTooltip, TTM_ACTIVATE, TRUE, 0);
-		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse your Istaria Root Game Folder");
+		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse/Select your Istaria Root Game Folder");
 		AddTooltip(g_state->hTooltip, g_state->hRunButton, L"Download/Update/Sync/Install MapPack 5.0");
 		AddTooltip(g_state->hTooltip, g_state->hCancelBtn, L"Cancel current action");
 		AddTooltip(g_state->hTooltip, g_state->hDeleteBtn, L"Remove/Uninstall MapPack 5.0 (or Older 4.0 versions)");
@@ -5930,10 +6327,50 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		AddTooltip(g_state->hTooltip, g_state->hCopyLogBtn, L"Copy Log to the clipboard");
 		AddTooltip(g_state->hTooltip, g_state->hSaveLogBtn, L"Save Log to a .txt file");
 		AddTooltip(g_state->hTooltip, g_state->hHelpBtn, L"Reload Help (Also displays upon startup)");
+		AddTooltip(g_state->hTooltip, g_state->hAboutBtn, L"Show diagnostic system information");
 		AddTooltip(g_state->hTooltip, g_state->hCheckUpdatesBtn, L"Check for updates of MapPack Sync Tool");
+		AddTooltip(g_state->hTooltip, g_state->hChangeLogBtn, L"Download and display Change Log");
 	}
 	LayoutMainWindow(g_state->hMainWnd, g_state);
 	SendMessageW(g_state->hOutput, EM_EXLIMITTEXT, 0, (LPARAM)(8ULL * 1024ULL * 1024ULL));
+
+	// Startup support files must be refreshed before EnsureTermsAccepted(), because
+	// terms acceptance must use the freshly updated MapPackSyncTool_Terms.txt.
+	//
+	// However, do not briefly show "Checking for Help/Support files updates ..."
+	// on first-run / unaccepted-terms launches. In that case, the next user-visible
+	// blocker is the Terms dialog, so show the terms-waiting status from the start.
+	const bool termsAcceptedBeforeStartupRefresh = HasAcceptedCurrentTerms();
+	SetStatusText(g_state, termsAcceptedBeforeStartupRefresh
+		? L"Checking for Help/Support files updates ..."
+		: L"Awaiting user to accept Terms of Use ...");
+	UpdateWindow(g_state->hOutput);
+	UpdateWindow(g_state->hProgressText);
+	UpdateWindow(g_state->hMainWnd);
+
+	if (!RefreshStartupSupportFiles(g_state->hMainWnd))
+	{
+		SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
+		DestroyWindow(g_state->hMainWnd);
+		ReleaseSingleInstanceMutex();
+		return 0;
+	}
+
+	SetWindowTextW(g_state->hMainWnd, kWindowTitle.c_str());
+	UpdateWindow(g_state->hMainWnd);
+
+	if (!EnsureTermsAccepted(g_state->hMainWnd))
+	{
+		DestroyWindow(g_state->hMainWnd);
+		ReleaseSingleInstanceMutex();
+		return 0;
+	}
+
+	// Now that Help/Support files and Terms are current, replace the startup status
+	// in the RichEdit box with the freshly updated Help file.
+	LoadHelpTextIntoOutput(true, false);
+	SetStatusText(g_state, L"Ready");
+
 	if (g_pendingAutoAction == PendingAutoAction::Sync)
 	{
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hRunButton);
@@ -5946,9 +6383,13 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	{
 		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hCheckUpdatesBtn);
 	}
+	else if (g_pendingAutoAction == PendingAutoAction::ChangeLog)
+	{
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hChangeLogBtn);
+	}
 	else
 	{
-		if (EnsureUpdateAccessOrRelaunch(g_state->hMainWnd))
+		if (EnsureUpdateWriteAccessOrPromptElevation(g_state->hMainWnd))
 			StartCheckForUpdates(true);
 	}
 	MSG msg;
