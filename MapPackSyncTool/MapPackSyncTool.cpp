@@ -154,6 +154,15 @@ namespace AppConstants
 	static constexpr long kManifestTimeoutSec = 120L;
 	static constexpr long kFileConnectTimeoutMs = 15000L;
 	static constexpr long kFileTimeoutMs = 0L;
+
+	// Defensive download-size caps. These are intentionally generous so normal
+	// MapPack content is unaffected, while bad server responses cannot stream forever
+	// or unexpectedly fill the user's disk.
+	static constexpr unsigned long long kMaxTextDownloadBytes = 4ull * 1024ull * 1024ull;          // manifests/version text - 4MB max
+	static constexpr unsigned long long kMaxSupportFileDownloadBytes = 25ull * 1024ull * 1024ull;  // help/terms/readme/changelog - 25MB max
+	static constexpr unsigned long long kMaxSyncedFileDownloadBytes = 512ull * 1024ull * 1024ull;  // individual manifest files -512MB max
+	static constexpr unsigned long long kMaxUpdateExeDownloadBytes = 10ull * 1024ull * 1024ull;    // application update EXE - 10MB max
+
 	// We are defining this twice because WinHttp expects wide
 	static constexpr const char* kUserAgent = "MapPackSyncTool by Cegaiel";
 	static constexpr const wchar_t* kUserAgentW = L"MapPackSyncTool by Cegaiel";
@@ -179,7 +188,7 @@ static constexpr const wchar_t* kLegacyUpdaterExeFileName = L"MapPackSyncTool_Up
 // Global UI layout (initial size + margins)
 // --------------------------------------------------
 static const int MAIN_WINDOW_WIDTH = 850;  // initial window width
-static const int MAIN_WINDOW_HEIGHT = 850;   // initial window height
+static const int MAIN_WINDOW_HEIGHT = 860;   // initial window height
 // RichEdit margins (client area)
 static const int OUTPUT_MARGIN_LEFT = 10;
 static const int OUTPUT_MARGIN_TOP = 95;
@@ -1220,14 +1229,14 @@ namespace helpers
 			break;
 		case UiMode::Running:
 			SetUiForWorkerRunning(st, true);
-			UpdateStatusBarText(st, L"Working...");
+			UpdateStatusBarText(st, L"Working ...");
 			SetProgressVisible(st, true);
 			break;
 		case UiMode::Canceling:
 			// Cancel has been requested; prevent repeat clicks but keep worker running.
 			SetUiForWorkerRunning(st, true);
 			EnableCtl(st->hCancelBtn, false);
-			UpdateStatusBarText(st, L"Canceling...");
+			UpdateStatusBarText(st, L"Canceling ...");
 			break;
 		}
 	}
@@ -2123,7 +2132,8 @@ static bool DownloadUrlToFileNoVerify(
 	const fs::path& destFile,
 	const CancelToken& cancel,
 	std::string* outErr,
-	long* outHttp);
+	long* outHttp,
+	unsigned long long maxBytes = AppConstants::kMaxSupportFileDownloadBytes);
 static bool MoveReplace(const fs::path& from, const fs::path& to);
 
 static bool AreFilesByteIdentical(const fs::path& a, const fs::path& b, std::wstring* outErr = nullptr)
@@ -3384,8 +3394,8 @@ static bool WinHttpGetToString_NoRedirects(
 		return false;
 
 	// Text downloads should be small (manifest/version). Cap defensively.
-	const size_t kMaxTextBytes = 4u * 1024u * 1024u; // 4 MB
-	return WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel, kMaxTextBytes, outErr);
+	return WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel,
+		static_cast<size_t>(AppConstants::kMaxTextDownloadBytes), outErr);
 }
 
 
@@ -3406,8 +3416,8 @@ static Status WinHttpGetToString_NoRedirects_Status(
 	}
 
 	// Text downloads should be small (manifest/version). Cap defensively.
-	const size_t kMaxTextBytes = 4u * 1024u * 1024u; // 4 MB
-	if (!WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel, kMaxTextBytes, &err)) {
+	if (!WinHttpReadAllToString((HINTERNET)ctx.request.get(), outBody, cancel,
+		static_cast<size_t>(AppConstants::kMaxTextDownloadBytes), &err)) {
 		if (outHttp) *outHttp = http;
 		return Status::FailMsg(Utf8ToWide(err));
 	}
@@ -3487,7 +3497,8 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 	long connectTimeoutMs,
 	long totalTimeoutMs,
 	std::string* outErr,
-	long* outHttp)
+	long* outHttp,
+	unsigned long long maxBytes)
 {
 	if (outErr) outErr->clear();
 	if (outHttp) *outHttp = 0;
@@ -3495,6 +3506,8 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 	WinHttpGetCtx http;
 	if (!WinHttpOpenGet_NoRedirects(urlUtf8, http, cancel, connectTimeoutMs, totalTimeoutMs, outErr, outHttp))
 		return false;
+
+	unsigned long long downloadedBytes = 0;
 
 	for (;;)
 	{
@@ -3508,6 +3521,12 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 		}
 		if (avail == 0) break;
 
+		if (maxBytes > 0 && downloadedBytes + static_cast<unsigned long long>(avail) > maxBytes)
+		{
+			if (outErr) *outErr = "Download too large; exceeded " + std::to_string(maxBytes) + " bytes";
+			return false;
+		}
+
 		std::vector<char> buf(avail);
 		DWORD read = 0;
 		if (!WinHttpReadData((HINTERNET)http.request.get(), buf.data(), avail, &read))
@@ -3516,6 +3535,7 @@ static bool WinHttpDownloadToFileAndHash_NoRedirects(
 			return false;
 		}
 		if (read == 0) break;
+		downloadedBytes += static_cast<unsigned long long>(read);
 
 		if (ctx.f)
 		{
@@ -3584,7 +3604,8 @@ static bool DownloadUrlToFileVerifySha256(
 	const long totalMs = AppConstants::kFileTimeoutMs;
 	std::string dlErr;
 	long code = 0;
-	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs, &dlErr, &code);
+	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs,
+		&dlErr, &code, AppConstants::kMaxSyncedFileDownloadBytes);
 	if (outHttp) *outHttp = code;
 	fflush(ctx.f);
 	fclose(ctx.f);
@@ -3630,8 +3651,9 @@ static bool DownloadUrlToFileNoVerify(
 	const std::string& url,
 	const fs::path& destFile,
 	const CancelToken& cancel,
-	std::string* outErr = nullptr,
-	long* outHttp = nullptr)
+	std::string* outErr,
+	long* outHttp,
+	unsigned long long maxBytes)
 {
 	if (outErr) outErr->clear();
 	if (outHttp) *outHttp = 0;
@@ -3661,7 +3683,8 @@ static bool DownloadUrlToFileNoVerify(
 	const long totalMs = AppConstants::kFileTimeoutMs;
 	std::string dlErr;
 	long code = 0;
-	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs, &dlErr, &code);
+	bool ok = WinHttpDownloadToFileAndHash_NoRedirects(url, ctx, cancel, connectMs, totalMs,
+		&dlErr, &code, maxBytes);
 	if (outHttp) *outHttp = code;
 
 	fflush(ctx.f);
@@ -3689,12 +3712,25 @@ static bool DownloadUrlToFileNoVerify(
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
-static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false)
+struct EmptyDirRemovalStats
+{
+	int removed = 0;
+	int failed = 0;
+
+	EmptyDirRemovalStats& operator+=(const EmptyDirRemovalStats& rhs)
+	{
+		removed += rhs.removed;
+		failed += rhs.failed;
+		return *this;
+	}
+};
+
+static EmptyDirRemovalStats RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false)
 {
 	std::error_code ec;
-	int removedDirs = 0;
+	EmptyDirRemovalStats stats;
 	if (!fs::exists(root, ec) || !fs::is_directory(root, ec))
-		return 0;
+		return stats;
 	std::vector<fs::path> dirs;
 	for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
 		it != fs::recursive_directory_iterator(); it.increment(ec))
@@ -3711,13 +3747,16 @@ static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false
 	{
 		if (fs::is_directory(d, ec) && fs::is_empty(d, ec))
 		{
-			if (fs::remove(d, ec))
+			ec.clear();
+			if (fs::remove(d, ec) && !ec)
 			{
 				Log("  REMOVED EMPTY DIR: " + PathToUtf8(d) + "\r\n");
-				++removedDirs;
+				++stats.removed;
 			}
 			else
 			{
+				++stats.failed;
+				Log("  FAILED REMOVE EMPTY DIR: " + PathToUtf8(d) + " (" + (ec ? ec.message() : std::string("unknown")) + ")\r\n");
 				ec.clear();
 			}
 		}
@@ -3730,10 +3769,17 @@ static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false
 	{
 		if (fs::is_directory(root, ec) && fs::is_empty(root, ec))
 		{
-			if (fs::remove(root, ec))
+			ec.clear();
+			if (fs::remove(root, ec) && !ec)
 			{
 				Log("  REMOVED EMPTY DIR: " + PathToUtf8(root) + "\r\n");
-				++removedDirs;
+				++stats.removed;
+			}
+			else
+			{
+				++stats.failed;
+				Log("  FAILED REMOVE EMPTY DIR: " + PathToUtf8(root) + " (" + (ec ? ec.message() : std::string("unknown")) + ")\r\n");
+				ec.clear();
 			}
 		}
 		else
@@ -3741,7 +3787,7 @@ static int RemoveEmptyDirsBottomUp(const fs::path& root, bool removeRoot = false
 			ec.clear();
 		}
 	}
-	return removedDirs;
+	return stats;
 }
 // --------------------------------------------------
 // Ensure prefs\ClientPrefs_Common.def has correct mapPath
@@ -3827,7 +3873,7 @@ static void UpdateClientPrefsMapPath(const SyncConfig& cfg, const CancelToken& c
 				return;
 			}
 		}
-		Log(std::string("Checking 'string mapPath' in: \\prefs\\ClientPrefs_Common.def  (") + (context ? context : "") + "):\r\n  It's Incorrect -> Updating...\r\n  Old: " + currentValue + "\r\n  New: " + desiredValue + "\r\n");
+		Log(std::string("Checking 'string mapPath' in: \\prefs\\ClientPrefs_Common.def  (") + (context ? context : "") + "):\r\n  It's incorrect!  Updating now ...\r\n  Old: " + currentValue + "\r\n  New: " + desiredValue + "\r\n");
 	}
 	catch (...)
 	{
@@ -3911,7 +3957,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 {
 	if (cancel.IsCanceled()) return;
 	LogSeparator();
-	Log("Downloading manifest for old MapPack 4.0 and earlier versions ... ");
+	Log("Downloading manifest for old MapPack 4.0 (applies to earlier versions, too) ... ");
 
 	const std::string url = JoinUrl(cfg.remoteHost, kManifestOldPath);
 	std::string jsonText;
@@ -3930,10 +3976,10 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		return;
 	}
 
-	Log("Success!\r\n");
+	Log("Success!");
 	LogSeparator();
+	Log("MapPack 4.0 Clean-up: Searching files that exists AND are in the manifest (Needs deleted) ...\r\n");
 
-	Log("Parsing and removing files from old MapPack 4.0...\r\n");
 	const fs::path oldRoot = cfg.localBase / "resources_override";
 
 	int deleted = 0;
@@ -3954,7 +4000,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		if (!ec)
 		{
 			++deleted;
-			Log("  DELETED (old): " + rp + "\r\n");
+			Log("  DELETED: " + rp + "\r\n");
 		}
 		else
 		{
@@ -3968,22 +4014,31 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 	const fs::path oldTexturesRoot = oldRoot / "resources" / "interface" / "themes" / "default" / "textures";
 
 	if (deleted > 0 || failed > 0)
-		Log("\r\n"); //Add blank line
-	Log("MapPack 4.0 Deleted Files Summary:\r\n");
-	Log("  Deletions: " + std::to_string(deleted) + "\r\n");
-	Log("  Failed deletions: " + std::to_string(failed) + "\r\n");
+	{
+		Log("\r\nFile Delete Summary:\r\n");
+		Log("  Deletions: " + std::to_string(deleted) + "\r\n");
+		Log("  Failed deletions: " + std::to_string(failed) + "\r\n");
+	}
+	else
+		Log("  No files found that needs deleted.");
+
 
 	if (!cancel.IsCanceled())
 	{
 		LogSeparator();
-		Log("Removing empty directories from MapPack 4.0 (maps/textures folders only)...\r\n");
-		const int removedDirs = RemoveEmptyDirsBottomUp(oldMapsRoot);
-		if (removedDirs == 0)
-			Log("  No empty sub-directories found; Nothing  to delete.\r\n");
+		Log("MapPack 4.0 Clean-up: Searching empty sub-directories (maps/textures folders only) that exists (Needs deleted) ...\r\n");
+
+		EmptyDirRemovalStats oldDirStats;
+		oldDirStats += RemoveEmptyDirsBottomUp(oldMapsRoot);
+		oldDirStats += RemoveEmptyDirsBottomUp(oldTexturesRoot);
+
+		if (oldDirStats.removed == 0 && oldDirStats.failed == 0)
+			Log("  No empty sub-directories found; Nothing to delete.\r\n");
 		else
 		{
-			Log("\r\nEmpty Subdirectories (old) Removal Summary:\r\n"); //zz
-			Log("  Deletions: " + std::to_string(removedDirs) + "\r\n"); //zz
+			Log("\r\nEmpty Subdirectories Removal Summary:\r\n"); //zz
+			Log("  Deletions: " + std::to_string(oldDirStats.removed) + "\r\n"); //zz
+			Log("  Failed deletions: " + std::to_string(oldDirStats.failed) + "\r\n"); //zz
 		}
 	}
 }
@@ -4051,7 +4106,7 @@ static bool DownloadAndParseManifest(const SyncConfig& cfg, ManifestData& out, s
 	if (cancel.IsCanceled()) { outErr = "canceled"; return false; }
 	out = ManifestData{};
 	outErr.clear();
-	Log("Downloading MapPack 5.0 manifest... ");
+	Log("Downloading MapPack 5.0 manifest ... ");
 
 	PostProgressMarqueeOn();
 	PostProgressTextW(L"Downloading manifest ...");
@@ -4090,7 +4145,7 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 	size_t filesDeleted = 0;
 
 	LogSeparator();
-	Log("Clean-up MapPack 5.0: Searching local files that exist but are not in the manifest; Those need deleted...\r\n");
+	Log("MapPack 5.0 Clean-up: Searching files that exist but are NOT in the manifest (Needs deleted) ...\r\n");
 	std::vector<fs::path> localFiles;
 	// Scan entire sync root (resources_override/mappack/)
 	if (fs::exists(cfg.localSyncRoot))
@@ -4104,13 +4159,13 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 	}
 	else
 	{
-		Log("NOTE: sync root folder not found; nothing to delete.\r\n");
+		Log("NOTE: Sync Root folder not found; nothing to delete.\r\n");
 		Log("Expected: " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
 		return;
 	}
 	for (const auto& fullPath : localFiles)
 	{
-		if (CheckAndHandleCancel(cancel, "INFO: Canceling... stopping deletions.\r\n"))
+		if (CheckAndHandleCancel(cancel, "INFO: Canceling ... stopping deletions.\r\n"))
 			return;
 		fs::path relPathFs = fs::relative(fullPath, cfg.localSyncRoot);
 		std::string rel = NormalizeManifestRel(relPathFs.generic_string());
@@ -4130,16 +4185,18 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 		}
 	}
 	if (filesDeleted == 0 && failedDeletes == 0)
-		Log("  No files found that needs to be deleted!\r\n");
-
-	Log("\r\nFile Delete Summary:\r\n");
-	Log("  Deletions:  " + std::to_string(filesDeleted) + "\r\n");
-	Log("  Failed deletions:  " + std::to_string(failedDeletes) + "\r\n");
+		Log("  No files found that needs deleted.\r\n");
+	else
+	{
+		Log("\r\nFile Delete Summary:\r\n");
+		Log("  Deletions:  " + std::to_string(filesDeleted) + "\r\n");
+		Log("  Failed deletions:  " + std::to_string(failedDeletes) + "\r\n");
+	}
 }
 static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md, SyncCounters& ioCounts, const CancelToken& cancel)
 {
 	if (cancel.IsCanceled()) return;
-	Log("Parsing MapPack 5.0 manifest: Searching for any local files that are missing or has changed (Needs updated)...\r\n");
+	Log("Parsing MapPack 5.0 manifest: Searching files that are missing or has changed (Needs updated) ...\r\n");
 	bool anyChanged = false;
 	PostProgressInit(md.workList.size());
 	for (size_t i = 0; i < md.workList.size(); ++i)
@@ -4223,7 +4280,7 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 	Log("  Manifest file count: " + std::to_string(md.workList.size()) + "\r\n");
 	if (CheckAndHandleCancel(cancel, "INFO: Canceled after manifest.\r\n"))
 		return;
-	Log("\r\nSyncing MapPack 5.0 root folder:  " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
+	Log("\r\nSyncing MapPack 5.0 Root folder:  " + PathToUtf8(cfg.localSyncRoot) + "\r\n");
 	SyncCounters counts;
 	LogSeparator();
 
@@ -4241,14 +4298,17 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 		return;
 
 	LogSeparator();
-	Log("Clean-up/Remove MapPack 5.0 empty sub-directories...\r\n");
-	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
+	Log("MapPack 5.0 Clean-up: Searching empty sub-directories that exists (Needs deleted) ...\r\n");
+	const EmptyDirRemovalStats dirStats = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
 
-	if (removedDirs == 0)
-		Log("  No empty sub-directories found; Nothing to delete.\r\n");
+	if (dirStats.removed == 0 && dirStats.failed == 0)
+		Log("  No empty sub-directories found that needs deleted.\r\n");
 	else
-		Log("\r\nEmpty Directory Removal Summary:\r\n");
-	//	Log("  Directories removed: " + std::to_string(removedDirs) + "\r\n");
+	{
+		Log("\r\nEmpty Subdirectories Removal Summary:\r\n");
+		Log("  Deletions: " + std::to_string(dirStats.removed) + "\r\n");
+		Log("  Failed deletions: " + std::to_string(dirStats.failed) + "\r\n");
+	}
 
 	if (IsCanceledNoNotify(cancel)) return;
 	RemoveOldManifestListedFiles(cfg, cancel);
@@ -4285,7 +4345,7 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 		return;
 
 	LogSeparator();
-	Log("Parsing and removing files from MapPack 5.0 manifest...\r\n");
+	Log("Parsing and removing files from MapPack 5.0 manifest ...\r\n");
 	PostProgressInit(md.workList.size());
 
 	size_t deleted = 0;
@@ -4330,15 +4390,16 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 
 	if (IsCanceledNoNotify(cancel)) return;
 	LogSeparator();
-	Log("Removing empty sub-directories from MapPack 5.0 (sync root)...\r\n");
+	Log("Removing empty sub-directories from MapPack 5.0 (sync root) ...\r\n");
 
-	const int removedDirs = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
-	if (removedDirs == 0)
-		Log("  No empty sub-directories found; Nothing  to delete.\r\n");
+	const EmptyDirRemovalStats dirStats = RemoveEmptyDirsBottomUp(cfg.localSyncRoot, true);
+	if (dirStats.removed == 0 && dirStats.failed == 0)
+		Log("  No empty sub-directories found; Nothing to delete.\r\n");
 	else
 	{
-		Log("\r\nEmpty Subdirectories (MapPack 5.0) Removal Summary:\r\n"); //zz
-		Log("  Deletions: " + std::to_string(removedDirs) + "\r\n"); //zz
+		Log("\r\nEmpty Subdirectories Removal Summary:\r\n");
+		Log("  Deletions: " + std::to_string(dirStats.removed) + "\r\n");
+		Log("  Failed deletions: " + std::to_string(dirStats.failed) + "\r\n");
 	}
 	if (IsCanceledNoNotify(cancel)) return;
 	RemoveOldManifestListedFiles(cfg, cancel);
@@ -4736,6 +4797,7 @@ static bool WinHttpDownloadUrlToFile(const wchar_t* url, const fs::path& outFile
 	ScopeExit closeFile{ [&]() { CloseHandle(hFile); } };
 
 	std::vector<char> buf(64 * 1024);
+	unsigned long long downloadedBytes = 0;
 
 	for (;;)
 	{
@@ -4746,6 +4808,11 @@ static bool WinHttpDownloadUrlToFile(const wchar_t* url, const fs::path& outFile
 			return false;
 		}
 		if (avail == 0) break;
+		if (downloadedBytes + static_cast<unsigned long long>(avail) > AppConstants::kMaxUpdateExeDownloadBytes)
+		{
+			outErr = L"Download too large; exceeded update EXE size limit";
+			return false;
+		}
 		DWORD toRead = min(avail, (DWORD)buf.size());
 		DWORD read = 0;
 		if (!WinHttpReadData(hRequest, buf.data(), toRead, &read))
@@ -4754,6 +4821,7 @@ static bool WinHttpDownloadUrlToFile(const wchar_t* url, const fs::path& outFile
 			return false;
 		}
 		if (read == 0) break;
+		downloadedBytes += static_cast<unsigned long long>(read);
 		DWORD wrote = 0;
 		if (!WriteFile(hFile, buf.data(), read, &wrote, nullptr) || wrote != read)
 		{
@@ -4814,15 +4882,22 @@ static bool WinHttpDownloadUrlToUtf8String(const wchar_t* url, std::string& out,
 	}
 
 	std::vector<char> buf(64 * 1024);
+	unsigned long long downloadedBytes = 0;
 	for (;;)
 	{
 		DWORD avail = 0;
 		if (!WinHttpQueryDataAvailable(hRequest, &avail)) { outErr = L"WinHttpQueryDataAvailable failed"; return false; }
 		if (avail == 0) break;
+		if (downloadedBytes + static_cast<unsigned long long>(avail) > AppConstants::kMaxTextDownloadBytes)
+		{
+			outErr = L"Download too large; exceeded text response size limit";
+			return false;
+		}
 		DWORD toRead = min(avail, (DWORD)buf.size());
 		DWORD read = 0;
 		if (!WinHttpReadData(hRequest, buf.data(), toRead, &read)) { outErr = L"WinHttpReadData failed"; return false; }
 		if (read == 0) break;
+		downloadedBytes += static_cast<unsigned long long>(read);
 		out.append(buf.data(), buf.data() + read);
 	}
 	return true;
@@ -5704,7 +5779,7 @@ static bool LoadRemoteChangeLogIntoOutput(AppState* st)
 	std::wstring err;
 
 	ClearOutput(st);
-	SetStatusText(st, L"Checking latest version of Change Log...");
+	SetStatusText(st, L"Checking latest version of Change Log ...");
 	EnableCtl(st->hChangeLogBtn, false);
 	HCURSOR oldCursor = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
 	const bool downloaded = DownloadRemoteAppFilePreserveTimestamp(
@@ -5796,7 +5871,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 		{
 			st->cancelRequested.store(true);
 			ApplyUiMode(st, UiMode::Canceling);
-			PostProgressTextW(L"Cancel requested... finishing current transfer.");
+			PostProgressTextW(L"Cancel requested ... finishing current transfer.");
 			Log("INFO: Cancel sync requested.\r\n");
 		}
 	}
@@ -5951,7 +6026,7 @@ static LRESULT HandleWmClose(AppState* st, HWND hwnd)
 			if (st->hCancelBtn) EnableCtl(st->hCancelBtn, false);
 			FreezeProgressOnCancel(st);
 			EnableCtl(st->hDeleteBtn, true);
-			PostProgressTextW(L"Cancel requested... exiting when safe.");
+			PostProgressTextW(L"Cancel requested ... exiting when safe.");
 			Log("INFO: Window close requested during sync; canceling.\r\n");
 			return 0;
 		}
