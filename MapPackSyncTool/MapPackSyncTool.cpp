@@ -317,6 +317,8 @@ struct AppState
 	bool progressFrozenOnCancel = false;
 	HANDLE hUpdateThread = nullptr;
 	std::atomic_bool isUpdateRunning{ false };
+	HANDLE hManifestCheckThread = nullptr;
+	std::atomic_bool isManifestCheckRunning{ false };
 	bool logActionsArmed = false;
 };
 static AppState* g_state = nullptr;
@@ -359,6 +361,8 @@ static const wchar_t* kIniKeyLastFolder = L"LastFolder";
 static const wchar_t* kIniSectionLicense = L"License";
 static const wchar_t* kIniKeyTermsAccepted = L"TermsAccepted";
 static const wchar_t* kIniKeyTermsVersion = L"TermsVersion";
+static const wchar_t* kIniSectionManifest = L"Manifest";
+static const wchar_t* kIniKeyManifestSha256 = L"LastSyncedManifestSha256";
 // Should I ever come out with new Terms of Use, then increment below line by one number.
 // This will show user latest terms and force them to Accept the latest terms of use again; Hence updating [License] TermsVersion in the .ini file.
 static constexpr int kCurrentTermsVersion = 1;
@@ -611,6 +615,35 @@ static bool IniWriteAcceptedTermsVersion(int version, std::wstring* outErr = nul
 	return true;
 }
 
+static std::wstring IniReadLastSyncedManifestSha256()
+{
+	wchar_t buf[256]{};
+	const std::wstring iniPath = GetSettingsIniPath();
+	GetPrivateProfileStringW(kIniSectionManifest, kIniKeyManifestSha256, L"", buf, (DWORD)_countof(buf), iniPath.c_str());
+	std::wstring out(buf);
+	TrimInPlace(out);
+	return out;
+}
+
+static bool IniWriteLastSyncedManifestInfo(const std::string& sha256Lower, std::wstring* outErr = nullptr)
+{
+	if (outErr) outErr->clear();
+	if (sha256Lower.size() != 64)
+	{
+		if (outErr) *outErr = L"Internal error: manifest SHA-256 is invalid.";
+		return false;
+	}
+
+	std::wstring shaW(sha256Lower.begin(), sha256Lower.end());
+	std::wstring err;
+	if (!IniWriteStringVerified(kIniSectionManifest, kIniKeyManifestSha256, shaW, &err))
+	{
+		if (outErr) *outErr = err;
+		return false;
+	}
+	return true;
+}
+
 
 struct CancelToken
 {
@@ -751,7 +784,8 @@ enum class UiEventKind : int
 	ProgressSet,        // u1 = pos
 	ProgressTextW,      // text = progress label
 	WorkerDone,
-	UpdateResultPtr     // ptr = UpdateResult*
+	UpdateResultPtr,    // ptr = UpdateResult*
+	ManifestCheckResultPtr // ptr = ManifestCheckResult*
 };
 
 struct UiEvent
@@ -1618,11 +1652,6 @@ static std::wstring BuildAboutSystemInfoText()
 	info += L"MapPack Sync Tool\r\n";
 	info += L"Version: " + GetDisplayVersion() + L"\r\n\r\n";
 
-	fs::path exePath = GetThisExePath();
-	info += L"Executable Path:\r\n";
-	info += exePath.empty() ? L"(unknown)" : exePath.wstring();
-	info += L"\r\n\r\n";
-
 	info += L"Application Directory:\r\n";
 	fs::path appDir;
 	std::wstring appDirErr;
@@ -1630,6 +1659,11 @@ static std::wstring BuildAboutSystemInfoText()
 		info += appDir.wstring();
 	else
 		info += L"(error) " + appDirErr;
+	info += L"\r\n\r\n";
+
+	fs::path exePath = GetThisExePath();
+	info += L"Executable Path:\r\n";
+	info += exePath.empty() ? L"(unknown)" : exePath.wstring();
 	info += L"\r\n\r\n";
 
 	info += L"Settings INI:\r\n";
@@ -1666,8 +1700,12 @@ static std::wstring BuildAboutSystemInfoText()
 	info += Utf8ToWide(kRemoteHost);
 	info += L"\r\n\r\n";
 
-	info += L"Remote Manifest:\r\n";
+	info += L"MapPack 5.0 Manifest:\r\n";
 	info += Utf8ToWide(std::string(kRemoteHost) + kManifestPath);
+	info += L"\r\n\r\n";
+
+	info += L"MapPack 4.0 Manifest:\r\n";
+	info += Utf8ToWide(std::string(kRemoteHost) + kManifestOldPath);
 	info += L"\r\n\r\n";
 
 	info += L"Update Version URL:\r\n";
@@ -2406,6 +2444,61 @@ static bool Sha256FileHexLower(const fs::path& filePath, std::string& outHex)
 	}
 	return true;
 }
+
+static bool Sha256BytesHexLower(const void* data, size_t size, std::string& outHex)
+{
+	outHex.clear();
+	if (!data && size != 0)
+		return false;
+
+	BCRYPT_ALG_HANDLE rawAlg = nullptr;
+	BCRYPT_HASH_HANDLE rawHash = nullptr;
+
+	NTSTATUS st = BCryptOpenAlgorithmProvider(&rawAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+	if (st != 0) return false;
+	BcryptAlgHandle hAlg(rawAlg);
+
+	DWORD objLen = 0, cbData = 0, hashLen = 0;
+	st = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbData, 0);
+	if (st != 0) return false;
+	st = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cbData, 0);
+	if (st != 0) return false;
+
+	std::vector<UCHAR> obj(objLen);
+	std::vector<UCHAR> hash(hashLen);
+
+	st = BCryptCreateHash(hAlg, &rawHash, obj.data(), (ULONG)obj.size(), nullptr, 0, 0);
+	if (st != 0) return false;
+	BcryptHashHandle hHash(rawHash);
+
+	const BYTE* bytes = static_cast<const BYTE*>(data);
+	while (size > 0)
+	{
+		const ULONG chunk = (size > 1024ull * 1024ull) ? (1024ul * 1024ul) : static_cast<ULONG>(size);
+		st = BCryptHashData(hHash, const_cast<PUCHAR>(bytes), chunk, 0);
+		if (st != 0) return false;
+		bytes += chunk;
+		size -= chunk;
+	}
+
+	st = BCryptFinishHash(hHash, hash.data(), (ULONG)hash.size(), 0);
+	if (st != 0) return false;
+
+	static const char* hexd = "0123456789abcdef";
+	outHex.resize(hash.size() * 2);
+	for (size_t i = 0; i < hash.size(); ++i)
+	{
+		outHex[i * 2 + 0] = hexd[(hash[i] >> 4) & 0xF];
+		outHex[i * 2 + 1] = hexd[hash[i] & 0xF];
+	}
+	return true;
+}
+
+static bool Sha256StringHexLower(const std::string& data, std::string& outHex)
+{
+	return Sha256BytesHexLower(data.empty() ? nullptr : data.data(), data.size(), outHex);
+}
+
 static bool StartsWith(const std::string& s, const std::string& prefix)
 {
 	return s.size() >= prefix.size() && memcmp(s.data(), prefix.data(), prefix.size()) == 0;
@@ -4033,12 +4126,12 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		oldDirStats += RemoveEmptyDirsBottomUp(oldTexturesRoot);
 
 		if (oldDirStats.removed == 0 && oldDirStats.failed == 0)
-			Log("  No empty sub-directories found; Nothing to delete.\r\n");
+			Log("  No empty sub-directories found that needs deleted.\r\n");
 		else
 		{
-			Log("\r\nEmpty Subdirectories Removal Summary:\r\n"); //zz
-			Log("  Deletions: " + std::to_string(oldDirStats.removed) + "\r\n"); //zz
-			Log("  Failed deletions: " + std::to_string(oldDirStats.failed) + "\r\n"); //zz
+			Log("\r\nEmpty Subdirectories Removal Summary:\r\n");
+			Log("  Deletions: " + std::to_string(oldDirStats.removed) + "\r\n");
+			Log("  Failed deletions: " + std::to_string(oldDirStats.failed) + "\r\n");
 		}
 	}
 }
@@ -4087,6 +4180,7 @@ struct ManifestData
 {
 	std::vector<ManifestEntry> workList;
 	std::unordered_set<std::string> manifestRelSet;
+	std::string manifestSha256Lower;
 };
 static std::string MakeFileUrlFromRemoteHost(const std::string& remotePath)
 {
@@ -4118,6 +4212,13 @@ static bool DownloadAndParseManifest(const SyncConfig& cfg, ManifestData& out, s
 		outErr = "Manifest download failed (HTTP " + std::to_string(http) + "): " + dlErr;
 		return false;
 	}
+	if (!Sha256StringHexLower(manifestText, out.manifestSha256Lower))
+	{
+		PostProgressMarqueeOff();
+		outErr = "Manifest SHA-256 calculation failed.";
+		return false;
+	}
+
 	std::vector<ManifestRawEntry> rawFiles;
 	std::string parseErr;
 	if (!ParseManifestRaw(manifestText, rawFiles, &parseErr))
@@ -4315,6 +4416,16 @@ static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
 	if (IsCanceledNoNotify(cancel)) return;
 	EnsureClientPrefsMapPath(cfg, cancel);
 	if (IsCanceledNoNotify(cancel)) return;
+
+	if (counts.failed == 0 && !md.manifestSha256Lower.empty())
+	{
+		std::wstring iniErr;
+		if (!IniWriteLastSyncedManifestInfo(md.manifestSha256Lower, &iniErr))
+		{
+			Log("WARNING: Sync completed, but failed to save manifest update marker to MapPackSyncTool.ini. You may be notified about this same manifest again next launch.\r\n");
+		}
+	}
+
 	LogSeparator();
 	Log("Sync complete");
 }
@@ -4910,6 +5021,115 @@ static bool WinHttpDownloadUrlToWideString(const wchar_t* url, std::wstring& out
 	out = Utf8ToWide(bytes);
 	return true;
 }
+
+struct ManifestCheckResult
+{
+	bool ok = false;
+	bool hasStoredBaseline = false;
+	bool manifestChanged = false;
+	std::string remoteSha256Lower;
+	std::wstring err;
+};
+
+static unsigned __stdcall ManifestCheckThreadProc(void* p)
+{
+	ManifestCheckResult* res = static_cast<ManifestCheckResult*>(p);
+	res->ok = false;
+	res->hasStoredBaseline = false;
+	res->manifestChanged = false;
+	res->err.clear();
+
+	CancelToken cancel{};
+	const std::string url = JoinUrl(kRemoteHost, kManifestPath);
+	std::string manifestText;
+	std::string dlErr;
+	long http = 0;
+	if (!DownloadUrl(url, manifestText, cancel, &dlErr, &http))
+	{
+		res->err = L"Failed to download mappack_manifest.json: " + Utf8ToWide(dlErr);
+		return 0;
+	}
+
+	std::string sha;
+	if (!Sha256StringHexLower(manifestText, sha))
+	{
+		res->err = L"Failed to calculate SHA-256 for mappack_manifest.json.";
+		return 0;
+	}
+
+	res->remoteSha256Lower = sha;
+
+	std::wstring storedW = IniReadLastSyncedManifestSha256();
+	res->hasStoredBaseline = !storedW.empty();
+	if (!res->hasStoredBaseline)
+	{
+		// First run / older INI: silently establish the current manifest as the baseline.
+		std::wstring iniErr;
+		(void)IniWriteLastSyncedManifestInfo(res->remoteSha256Lower, &iniErr);
+		res->ok = true;
+		return 0;
+	}
+
+	std::string stored = WideToUtf8(storedW);
+	res->manifestChanged = !EqualIcaseAscii(stored, res->remoteSha256Lower);
+	res->ok = true;
+	return 0;
+}
+
+static void StartManifestUpdateCheckOnStartup()
+{
+	AppState* st = g_state;
+	if (!st) return;
+	if (st->isManifestCheckRunning.exchange(true)) return;
+
+	ManifestCheckResult* res = new ManifestCheckResult();
+	uintptr_t th = _beginthreadex(nullptr, 0, ManifestCheckThreadProc, res, 0, nullptr);
+	if (!th)
+	{
+		st->isManifestCheckRunning.store(false);
+		delete res;
+		return;
+	}
+	st->hManifestCheckThread = reinterpret_cast<HANDLE>(th);
+
+	uintptr_t waiter = _beginthreadex(nullptr, 0, [](void* param)->unsigned {
+		auto* pair = static_cast<std::pair<AppState*, ManifestCheckResult*>*>(param);
+		WaitForSingleObject(pair->first->hManifestCheckThread, INFINITE);
+		UiEvent* ev = new UiEvent();
+		ev->kind = UiEventKind::ManifestCheckResultPtr;
+		ev->ptr = pair->second;
+		PostUiEventTo(pair->first->hMainWnd, ev);
+		delete pair;
+		return 0;
+		}, new std::pair<AppState*, ManifestCheckResult*>(st, res), 0, nullptr);
+	if (waiter) CloseHandle(reinterpret_cast<HANDLE>(waiter));
+}
+
+static LRESULT HandleWmAppManifestCheckResult(AppState* st, HWND hwnd, LPARAM lParam)
+{
+	std::unique_ptr<ManifestCheckResult> res(static_cast<ManifestCheckResult*>((void*)lParam));
+	if (st)
+	{
+		st->isManifestCheckRunning.store(false);
+		if (st->hManifestCheckThread)
+		{
+			CloseHandle(st->hManifestCheckThread);
+			st->hManifestCheckThread = nullptr;
+		}
+	}
+
+	// Startup manifest check is intentionally quiet on failure.
+	if (!res || !res->ok || !res->manifestChanged)
+		return 0;
+
+	MessageBoxW(
+		hwnd,
+		L"A MapPack manifest update is available.\r\n\r\nClick Add / Sync button to check and apply MapPack updates.",
+		L"MapPack Updates Available",
+		MB_OK | MB_ICONINFORMATION);
+	return 0;
+}
+
 struct UpdateResult
 {
 	bool ok = false;
@@ -5998,7 +6218,7 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 			if (!res->downloadedTemp.empty()) { DeleteFileW(res->downloadedTemp.c_str()); }
 			return 0;
 		}
-		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick OK to proceed with the update.";
+		std::wstring prompt = L"New version of MapPack Sync Tool is available.\r\n\r\nCurrent version: v" + res->localVersion + L"\r\n\r\nAvailable version: v" + res->remoteVersion + L"\r\n\r\nClick Yes to proceed with the update.";
 		int r = MessageBoxW(hwnd, prompt.c_str(), L"Checking for newer versions of MapPack Sync Tool", MB_YESNO | MB_ICONINFORMATION);
 		if (r != IDYES)
 		{
@@ -6135,6 +6355,9 @@ static LRESULT HandleWmAppUiEvent(HWND hwnd, LPARAM lParam)
 	case UiEventKind::UpdateResultPtr:
 		// Transfer ownership of UpdateResult* to the existing handler via lParam.
 		return HandleWmAppUpdateResult(st2, hwnd, (LPARAM)ev->ptr);
+	case UiEventKind::ManifestCheckResultPtr:
+		// Transfer ownership of ManifestCheckResult* to the existing handler via lParam.
+		return HandleWmAppManifestCheckResult(st2, hwnd, (LPARAM)ev->ptr);
 	default:
 		break;
 	}
@@ -6466,6 +6689,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	{
 		if (EnsureUpdateWriteAccessOrPromptElevation(g_state->hMainWnd))
 			StartCheckForUpdates(true);
+		StartManifestUpdateCheckOnStartup();
 	}
 	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0))
