@@ -886,8 +886,6 @@ namespace helpers
 	static void ClearOutput(AppState* st);
 	static void ClearOutput();
 	static bool ReadUtf8TextFileStrict(const fs::path& path, std::wstring& textW, std::wstring* outErr);
-	static void LoadHelpTextIntoOutput(AppState* st);
-	static void LoadHelpTextIntoOutput();
 	static void CopyOutputToClipboard(AppState* st);
 	static void CopyOutputToClipboard();
 	static void SaveOutputToFile(AppState* st);
@@ -1967,6 +1965,7 @@ static void StripSurroundingQuotes(std::wstring& s)
 struct PreflightResult
 {
 	bool ok = false;
+	bool accessDenied = false;
 	fs::path localBase;
 	fs::path localSyncRoot;
 	std::vector<std::string> errors;
@@ -1979,6 +1978,20 @@ struct SyncConfig
 	fs::path localBase;
 	fs::path localSyncRoot;
 };
+static bool IsLikelyAccessDeniedErrorCode(const std::error_code& ec)
+{
+	if (!ec)
+		return false;
+
+	// std::filesystem errors on Windows usually carry the Win32 value,
+	// but the category/comparison can vary depending on the standard library.
+	// Check both the generic permission_denied condition and the common Win32 codes.
+	if (ec == std::make_error_code(std::errc::permission_denied))
+		return true;
+
+	return IsLikelyAccessDeniedError(static_cast<DWORD>(ec.value()));
+}
+
 static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 {
 	PreflightResult r{};
@@ -1990,6 +2003,8 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 	}
 	if (!fs::exists(folderWs, ec) || !fs::is_directory(folderWs, ec))
 	{
+		if (IsLikelyAccessDeniedErrorCode(ec))
+			r.accessDenied = true;
 		r.errors.push_back("ERROR: Selected folder '" + WideToUtf8(folderWs) + "' does not exist. You need to choose a valid Istaria game folder to sync.\r\n");
 		if (ec) r.errors.push_back("fs::exists/is_directory error: " + std::string(ec.message()) + "\r\n");
 		return r;
@@ -2000,6 +2015,8 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 	ec.clear();
 	if (!fs::exists(istariaExe, ec))
 	{
+		if (IsLikelyAccessDeniedErrorCode(ec))
+			r.accessDenied = true;
 		r.errors.push_back("ERROR: Selected folder does not contain istaria.exe. You need to choose a valid Istaria game folder to sync.\r\n");
 		if (ec) r.errors.push_back("fs::exists error: " + std::string(ec.message()) + "\r\n");
 		return r;
@@ -2011,6 +2028,8 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 		fs::create_directories(r.localSyncRoot, ec);
 		if (ec)
 		{
+			if (IsLikelyAccessDeniedErrorCode(ec))
+				r.accessDenied = true;
 			r.errors.push_back("ERROR: Failed to create resources_override folder\r\n");
 			r.errors.push_back("Folder:   " + PathToUtf8(r.localBase) + "\r\n");
 			r.errors.push_back("Target:   " + PathToUtf8(r.localSyncRoot) + "\r\n");
@@ -2023,6 +2042,8 @@ static PreflightResult ValidateFolderSelection(const std::wstring& folderWs)
 		ec.clear();
 		if (!fs::is_directory(r.localSyncRoot, ec) || ec)
 		{
+			if (IsLikelyAccessDeniedErrorCode(ec))
+				r.accessDenied = true;
 			r.errors.push_back("ERROR: resources_override exists but is not a directory\r\n");
 			r.errors.push_back("Folder:   " + PathToUtf8(r.localBase) + "\r\n");
 			r.errors.push_back("Path:     " + PathToUtf8(r.localSyncRoot) + "\r\n");
@@ -2041,11 +2062,28 @@ static bool CanWriteToSelectedClientPrefsFolder(const fs::path& localBase, std::
 	return CanCreateAndDeleteTempFileInDirectory(prefsDir, outErr);
 }
 
-static bool CanWriteToSelectedMappackFolder(const fs::path& localSyncRoot, std::wstring* outErr)
+
+static bool CanWriteToSelectedMappackFolderTree(const fs::path& localBase, std::wstring* outErr)
 {
-	if (!EnsureDirectoryExistsForWrite(localSyncRoot, outErr))
+	if (outErr) outErr->clear();
+
+	const fs::path resourcesOverride = localBase / L"resources_override";
+	const fs::path mappackRoot = resourcesOverride / L"mappack";
+
+	// Check/create resources_override first so the popup reports the real
+	// failing level. If resources_override exists but cannot be written to,
+	// reporting resources_override\mappack is misleading because the child
+	// folder creation only failed because its parent is locked down.
+	if (!EnsureDirectoryExistsForWrite(resourcesOverride, outErr))
 		return false;
-	return CanCreateAndDeleteTempFileInDirectory(localSyncRoot, outErr);
+
+	if (!CanCreateAndDeleteTempFileInDirectory(resourcesOverride, outErr))
+		return false;
+
+	if (!EnsureDirectoryExistsForWrite(mappackRoot, outErr))
+		return false;
+
+	return CanCreateAndDeleteTempFileInDirectory(mappackRoot, outErr);
 }
 
 static bool CanWriteToApplicationDirectory(std::wstring* outErr)
@@ -2145,18 +2183,38 @@ static bool EnsureAppDirectoryWriteAccessOrPromptElevation(HWND owner, const wch
 
 static bool EnsureSelectedGameFolderWriteAccessOrPromptElevation(HWND owner, const std::wstring& folderWs, WorkerKind kind)
 {
-	PreflightResult pf = ValidateFolderSelection(folderWs);
-	if (!pf.ok)
-		return true;
-
 	const wchar_t* opName = (kind == WorkerKind::Remove) ? L"remove MapPack files" : L"sync MapPack files";
 	std::wstring args = (kind == WorkerKind::Remove) ? L"--auto-remove " : L"--auto-sync ";
 	args += QuoteCommandLineArg(folderWs);
 
+	PreflightResult pf = ValidateFolderSelection(folderWs);
+	if (!pf.ok)
+	{
+		if (!pf.accessDenied)
+			return true;
+
+		// ValidateFolderSelection can be the first place that discovers an ACL problem,
+		// especially when resources_override exists but the process cannot create
+		// resources_override\mappack under it. Previously that path only logged to
+		// the RichEdit box later in the worker thread and never offered elevation.
+		fs::path localBase = !pf.localBase.empty() ? pf.localBase : fs::path(folderWs);
+
+		return EnsureWriteAccessOrPromptElevation(
+			owner,
+			{
+				[localBase](std::wstring* err) { return CanWriteToSelectedMappackFolderTree(localBase, err); },
+				[localBase](std::wstring* err) { return CanWriteToSelectedClientPrefsFolder(localBase, err); }
+			},
+			L"The selected Istaria folder still is not writable.",
+			L"The selected Istaria folder requires administrator rights to " + std::wstring(opName) + L".",
+			args,
+			L"Please choose a writable game folder or adjust permissions.");
+	}
+
 	return EnsureWriteAccessOrPromptElevation(
 		owner,
 		{
-			[localSyncRoot = pf.localSyncRoot] (std::wstring* err) { return CanWriteToSelectedMappackFolder(localSyncRoot, err); },
+			[localBase = pf.localBase] (std::wstring* err) { return CanWriteToSelectedMappackFolderTree(localBase, err); },
 			[localBase = pf.localBase](std::wstring* err) { return CanWriteToSelectedClientPrefsFolder(localBase, err); }
 		},
 		L"The selected Istaria folder still is not writable.",
