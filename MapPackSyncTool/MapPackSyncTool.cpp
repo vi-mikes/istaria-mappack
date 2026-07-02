@@ -292,7 +292,8 @@ struct AppState
 	HWND hCopyLogBtn = nullptr;
 	HWND hSaveLogBtn = nullptr;
 	HWND hCheckUpdatesBtn = nullptr;
-	HWND hChangeLogBtn = nullptr;
+	HWND hProgramChangeLogBtn = nullptr;
+	HWND hMappackChangeLogBtn = nullptr;
 	HWND hPreferencesBtn = nullptr;
 	HWND hHelpBtn = nullptr;
 	HWND hAboutBtn = nullptr;
@@ -334,6 +335,7 @@ enum class PendingAutoAction
 	Remove,
 	Update,
 	ChangeLog,
+	MappackChangeLog,
 };
 
 static PendingAutoAction g_pendingAutoAction = PendingAutoAction::None;
@@ -379,7 +381,8 @@ static constexpr const char* kRemoteSupportHelpPath = "/MapPackSyncTool_Help.txt
 static constexpr const char* kRemoteSupportTermsPath = "/MapPackSyncTool_Terms.txt";
 static constexpr const char* kRemoteSupportReadmeDocxPath = "/README.docx";
 static constexpr const char* kRemoteSupportReadmeRtfPath = "/README.rtf";
-static constexpr const char* kRemoteChangeLogFilePath = "/changelog.txt";
+static constexpr const char* kRemoteProgramChangeLogFilePath = "/changelog.txt";
+static constexpr const char* kRemoteMappackChangeLogFilePath = "/changelog_mappack.txt";
 
 static std::wstring GetSettingsIniPath()
 {
@@ -691,12 +694,14 @@ static std::vector<fs::path> IniReadExclusions()
 	const std::wstring iniPath = GetSettingsIniPath();
 	const UINT count = GetPrivateProfileIntW(kIniSectionPreferences, kIniKeyExclusionCount, 0, iniPath.c_str());
 
+	std::vector<wchar_t> buf(32768, L'\0');
+
 	for (UINT i = 1; i <= count; ++i)
 	{
-		wchar_t buf[32768]{};
+		std::fill(buf.begin(), buf.end(), L'\0');
 		const std::wstring key = MakeIniExclusionKey(i);
-		GetPrivateProfileStringW(kIniSectionPreferences, key.c_str(), L"", buf, (DWORD)_countof(buf), iniPath.c_str());
-		std::wstring v(buf);
+		GetPrivateProfileStringW(kIniSectionPreferences, key.c_str(), L"", buf.data(), (DWORD)buf.size(), iniPath.c_str());
+		std::wstring v(buf.data());
 		TrimInPlace(v);
 		StripSurroundingQuotes(v);
 		if (!v.empty())
@@ -844,11 +849,12 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	int editW = browseX - gap - editX;
 	if (editW < 50) editW = 50;
 	// Button row under the folder path:
-	// - Add/Sync, Cancel Sync, Remove, Check for Updates, and Change Log flow left-to-right.
+	// - Add/Sync, Cancel Sync, Remove, Check for Updates, Program Change Log, and Mappack Change Log flow left-to-right.
 	// - Copy/Save/? remain right-aligned.
 	// Both progress controls sit below this button row.
-	const int updateW = 130;
-	const int changeLogW = 92;
+	const int updateW = 128;
+	const int programChangeLogW = 160;
+	const int mappackChangeLogW = 160;
 	const int helpW = 22;
 	const int aboutW = 22;
 	int buttonRowY = rowY + ctrlH + 10;
@@ -865,10 +871,11 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	// Group 1: main operations.
 	// Group 2: information/actions.
 	// Group 3: log export buttons anchored to the far right.
-	int updateX = deleteX + btnW + groupGap;
-	int changeLogX = updateX + updateW + gap + 15;
-	int helpX = changeLogX + changeLogW + gap + 20;
-	int aboutX = helpX + helpW + gap + 10;
+	int updateX = deleteX + btnW + groupGap - 20;
+	int programChangeLogX = updateX + updateW + 6;
+	int mappackChangeLogX = programChangeLogX + programChangeLogW + 6;
+	int helpX = mappackChangeLogX + mappackChangeLogW + 12;
+	int aboutX = helpX + helpW + 6;
 
 	int saveLogX = right - btnW;
 	int copyLogX = saveLogX - gap - btnW;
@@ -881,7 +888,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	if (outW < 10) outW = 10;
 	if (outH < 10) outH = 10;
 	// Batch repositioning to reduce redraw/flicker
-	HDWP hdwp = BeginDeferWindowPos(16);
+	HDWP hdwp = BeginDeferWindowPos(17);
 	if (!hdwp) {
 		if (st->hFolderLabel) MoveWindow(st->hFolderLabel, labelX, labelY, labelW, 20, TRUE);
 		if (st->hFolderEdit)  MoveWindow(st->hFolderEdit, editX, editY, editW, ctrlH, TRUE);
@@ -893,7 +900,8 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 		if (st->hProgress)     MoveWindow(st->hProgress, m, progY, progW, 14, TRUE);
 		if (st->hProgressText) MoveWindow(st->hProgressText, m, progTextY, progTextW, 22, TRUE);
 		if (st->hCheckUpdatesBtn) MoveWindow(st->hCheckUpdatesBtn, updateX, buttonRowY, updateW, btnH, TRUE);
-		if (st->hChangeLogBtn)    MoveWindow(st->hChangeLogBtn, changeLogX, buttonRowY, changeLogW, btnH, TRUE);
+		if (st->hProgramChangeLogBtn) MoveWindow(st->hProgramChangeLogBtn, programChangeLogX, buttonRowY, programChangeLogW, btnH, TRUE);
+		if (st->hMappackChangeLogBtn) MoveWindow(st->hMappackChangeLogBtn, mappackChangeLogX, buttonRowY, mappackChangeLogW, btnH, TRUE);
 		if (st->hCopyLogBtn)   MoveWindow(st->hCopyLogBtn, copyLogX, buttonRowY, btnW, btnH, TRUE);
 		if (st->hSaveLogBtn)   MoveWindow(st->hSaveLogBtn, saveLogX, buttonRowY, btnW, btnH, TRUE);
 		if (st->hHelpBtn)      MoveWindow(st->hHelpBtn, helpX, buttonRowY, helpW, btnH, TRUE);
@@ -916,7 +924,8 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	defer(st->hProgress, m, progY, progW, 14);
 	defer(st->hProgressText, m, progTextY, progTextW, 22);
 	defer(st->hCheckUpdatesBtn, updateX, buttonRowY, updateW, btnH);
-	defer(st->hChangeLogBtn, changeLogX, buttonRowY, changeLogW, btnH);
+	defer(st->hProgramChangeLogBtn, programChangeLogX, buttonRowY, programChangeLogW, btnH);
+	defer(st->hMappackChangeLogBtn, mappackChangeLogX, buttonRowY, mappackChangeLogW, btnH);
 	defer(st->hCopyLogBtn, copyLogX, buttonRowY, btnW, btnH);
 	defer(st->hSaveLogBtn, saveLogX, buttonRowY, btnW, btnH);
 	defer(st->hHelpBtn, helpX, buttonRowY, helpW, btnH);
@@ -1030,7 +1039,7 @@ namespace helpers
 
 	static void UpdateLogActionButtonsEnabled(AppState* st);
 	static void UpdateCheckUpdatesButtonEnabled(AppState* st);
-	static void UpdateChangeLogButtonEnabled(AppState* st);
+	static void UpdateChangeLogButtonsEnabled(AppState* st);
 	static void UpdateHelpButtonEnabled(AppState* st);
 
 	struct ProgressUpdate;
@@ -1204,35 +1213,36 @@ namespace helpers
 		if (!st) return;
 		if (st->isRunning.load())
 		{
-			if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, FALSE);
-			if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, FALSE);
+			EnableCtl(st->hCopyLogBtn, false);
+			EnableCtl(st->hSaveLogBtn, false);
 			return;
 		}
 
 		const BOOL enableLogActions = st->logActionsArmed ? TRUE : FALSE;
-		if (st->hCopyLogBtn) EnableWindow(st->hCopyLogBtn, enableLogActions);
-		if (st->hSaveLogBtn) EnableWindow(st->hSaveLogBtn, enableLogActions);
+		EnableCtl(st->hCopyLogBtn, enableLogActions != FALSE);
+		EnableCtl(st->hSaveLogBtn, enableLogActions != FALSE);
 	}
 
 	static void UpdateCheckUpdatesButtonEnabled(AppState* st)
 	{
 		if (!st || !st->hCheckUpdatesBtn) return;
 		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
-		EnableWindow(st->hCheckUpdatesBtn, enable ? TRUE : FALSE);
+		EnableCtl(st->hCheckUpdatesBtn, enable);
 	}
 
-	static void UpdateChangeLogButtonEnabled(AppState* st)
+	static void UpdateChangeLogButtonsEnabled(AppState* st)
 	{
-		if (!st || !st->hChangeLogBtn) return;
+		if (!st) return;
 		const bool enable = !st->isRunning.load() && !st->isUpdateRunning.load();
-		EnableWindow(st->hChangeLogBtn, enable ? TRUE : FALSE);
+		EnableCtl(st->hProgramChangeLogBtn, enable);
+		EnableCtl(st->hMappackChangeLogBtn, enable);
 	}
 
 	static void UpdateHelpButtonEnabled(AppState* st)
 	{
 		if (!st || !st->hHelpBtn) return;
 		const bool enable = st->logActionsArmed && !st->isRunning.load();
-		EnableWindow(st->hHelpBtn, enable ? TRUE : FALSE);
+		EnableCtl(st->hHelpBtn, enable);
 	}
 
 
@@ -1301,13 +1311,14 @@ namespace helpers
 			EnableCtl(st->hCopyLogBtn, false);
 			EnableCtl(st->hSaveLogBtn, false);
 			EnableCtl(st->hCheckUpdatesBtn, false);
-			EnableCtl(st->hChangeLogBtn, false);
+			EnableCtl(st->hProgramChangeLogBtn, false);
+			EnableCtl(st->hMappackChangeLogBtn, false);
 		}
 		else
 		{
 			UpdateLogActionButtonsEnabled(st);
 			UpdateCheckUpdatesButtonEnabled(st);
-			UpdateChangeLogButtonEnabled(st);
+			UpdateChangeLogButtonsEnabled(st);
 			UpdateHelpButtonEnabled(st);
 			EnableCtl(st->hAboutBtn, true);
 		}
@@ -5950,7 +5961,7 @@ static void StartCheckForUpdates(bool quietIfNoUpdate = false)
 	if (!st) return;
 	if (st->isUpdateRunning.exchange(true)) return;
 	UpdateCheckUpdatesButtonEnabled(st);
-	UpdateChangeLogButtonEnabled(st);
+	UpdateChangeLogButtonsEnabled(st);
 
 	UpdateResult* res = new UpdateResult();
 	res->quietIfNoUpdate = quietIfNoUpdate;
@@ -5959,7 +5970,7 @@ static void StartCheckForUpdates(bool quietIfNoUpdate = false)
 	{
 		st->isUpdateRunning.store(false);
 		UpdateCheckUpdatesButtonEnabled(st);
-		UpdateChangeLogButtonEnabled(st);
+		UpdateChangeLogButtonsEnabled(st);
 		delete res;
 		if (!quietIfNoUpdate)
 			Log("ERROR: Failed to start update thread.\r\n");
@@ -6256,42 +6267,53 @@ static LRESULT HandleWmGetMinMaxInfo(HWND hwnd, LPARAM lParam)
 }
 
 
-static bool LoadRemoteChangeLogIntoOutput(AppState* st)
+static bool LoadRemoteTextLogIntoOutput(
+	AppState* st,
+	const char* remotePath,
+	const wchar_t* localFileName,
+	const wchar_t* tempSuffix,
+	const wchar_t* logDisplayName,
+	const wchar_t* autoRelaunchArg,
+	HWND buttonToDisable)
 {
-	if (!st || !st->hMainWnd || !st->hOutput)
+	if (!st || !st->hMainWnd || !st->hOutput || !remotePath || !localFileName || !tempSuffix || !logDisplayName || !autoRelaunchArg)
 		return false;
 
-	// changelog.txt is cached next to the EXE, and the timestamp-preserve path
+	// Text logs are cached next to the EXE, and the timestamp-preserve path
 	// creates a temporary side file before replacing the real file only when
 	// content changes. Gate that temp-file write through the same elevation style
 	// used elsewhere instead of failing later during download/replace.
+	std::wstring elevationAction = L"download and cache the ";
+	elevationAction += logDisplayName;
 	if (!EnsureAppDirectoryWriteAccessOrPromptElevation(
 		st->hMainWnd,
-		L"download and cache the Change Log",
-		L"--auto-changelog"))
+		elevationAction.c_str(),
+		autoRelaunchArg))
 	{
 		return false;
 	}
 
-	std::string urlUtf8 = std::string(kRemoteHost) + kRemoteChangeLogFilePath;
+	std::string urlUtf8 = std::string(kRemoteHost) + remotePath;
 	std::wstring urlW = Utf8ToWide(urlUtf8);
 	std::wstring err;
 
 	ClearOutput(st);
-	SetStatusText(st, L"Checking latest version of Change Log ...");
-	EnableCtl(st->hChangeLogBtn, false);
+	SetStatusText(st, L"Checking latest version of " + std::wstring(logDisplayName) + L" ...");
+	EnableCtl(buttonToDisable, false);
 	HCURSOR oldCursor = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
 	const bool downloaded = DownloadRemoteAppFilePreserveTimestamp(
-		kRemoteChangeLogFilePath,
-		L"changelog.txt",
-		L".changelog-download",
+		remotePath,
+		localFileName,
+		tempSuffix,
 		&err);
 	SetCursor(oldCursor);
-	UpdateChangeLogButtonEnabled(st);
+	UpdateChangeLogButtonsEnabled(st);
 	if (!downloaded)
 	{
-		SetStatusText(st, L"Failed to load Change Log.");
-		std::wstring msg = L"Failed to download Change Log:\r\n\r\n" + err + L"\r\n\r\nURL:\r\n" + urlW;
+		SetStatusText(st, L"Failed to load " + std::wstring(logDisplayName) + L".");
+		std::wstring msg = L"Failed to download ";
+		msg += logDisplayName;
+		msg += L":\r\n\r\n" + err + L"\r\n\r\nURL:\r\n" + urlW;
 		MessageBoxW(st->hMainWnd, msg.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 		return false;
 	}
@@ -6299,28 +6321,55 @@ static bool LoadRemoteChangeLogIntoOutput(AppState* st)
 	fs::path appDir;
 	if (!GetApplicationDirectory(appDir, &err))
 	{
-		SetStatusText(st, L"Failed to load Change Log.");
+		SetStatusText(st, L"Failed to load " + std::wstring(logDisplayName) + L".");
 		MessageBoxW(st->hMainWnd, err.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 		return false;
 	}
 
 	std::wstring textW;
-	if (!ReadUtf8TextFileStrict(appDir / L"changelog.txt", textW, &err))
+	if (!ReadUtf8TextFileStrict(appDir / localFileName, textW, &err))
 	{
-		SetStatusText(st, L"Failed to load Change Log.");
+		SetStatusText(st, L"Failed to load " + std::wstring(logDisplayName) + L".");
 		MessageBoxW(st->hMainWnd, err.c_str(), L"MapPack Sync Tool", MB_OK | MB_ICONERROR);
 		return false;
 	}
 
 	if (textW.empty())
-		textW = L"Change Log is empty.";
+	{
+		textW = logDisplayName;
+		textW += L" is empty.";
+	}
 
 	OutputSetTextW(st, NormalizeToWindowsNewlines(textW), true);
 	st->logActionsArmed = true;
 	UpdateLogActionButtonsEnabled(st);
 	UpdateHelpButtonEnabled(st);
-	SetStatusText(st, L"Viewing latest changelog.txt.  Note this file can also be found in MapPack Sync Tool folder.");
+	SetStatusText(st, L"Viewing latest " + std::wstring(localFileName) + L".  Note this file can also be found in MapPack Sync Tool folder.");
 	return true;
+}
+
+static bool LoadRemoteProgramChangeLogIntoOutput(AppState* st)
+{
+	return LoadRemoteTextLogIntoOutput(
+		st,
+		kRemoteProgramChangeLogFilePath,
+		L"changelog.txt",
+		L".changelog-download",
+		L"Change Log: Program",
+		L"--auto-changelog",
+		st ? st->hProgramChangeLogBtn : nullptr);
+}
+
+static bool LoadRemoteMappackChangeLogIntoOutput(AppState* st)
+{
+	return LoadRemoteTextLogIntoOutput(
+		st,
+		kRemoteMappackChangeLogFilePath,
+		L"changelog_mappack.txt",
+		L".changelog-mappack-download",
+		L"Change Log: Mappack",
+		L"--auto-mappack-changelog",
+		st ? st->hMappackChangeLogBtn : nullptr);
 }
 
 
@@ -6669,13 +6718,35 @@ static void ShowExclusionsDialog(HWND owner)
 	SetActiveWindow(owner);
 }
 
+
+static bool ConfirmClearLogAndLoad(HWND owner, const wchar_t* whatToLoad)
+{
+	if (!whatToLoad)
+		return false;
+
+	std::wstring prompt = L"Clear Log and Load ";
+	prompt += whatToLoad;
+	prompt += L"?";
+
+	MessageBeep(MB_ICONASTERISK);
+	const int r = MessageBoxW(
+		owner,
+		prompt.c_str(),
+		L"MapPack Sync Tool",
+		MB_OKCANCEL | MB_ICONQUESTION
+	);
+	return r == IDOK;
+}
+
 static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
 {
+	if (!st)
+		return 0;
 
 	if ((HWND)lParam == st->hBrowseBtn)
 	{
 		std::wstring path;
-		std::wstring initialFolder = st && st->hFolderEdit ? GetTextCtl(st->hFolderEdit) : L"";
+		std::wstring initialFolder = st->hFolderEdit ? GetTextCtl(st->hFolderEdit) : L"";
 		TrimInPlace(initialFolder);
 		StripSurroundingQuotes(initialFolder);
 		if (initialFolder.empty())
@@ -6721,7 +6792,7 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 	}
 	else if ((HWND)lParam == st->hCancelBtn)
 	{
-		if (st && st->isRunning.load())
+		if (st->isRunning.load())
 		{
 			st->cancelRequested.store(true);
 			ApplyUiMode(st, UiMode::Canceling);
@@ -6768,44 +6839,30 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 			return 0;
 		StartCheckForUpdates(false);
 	}
-	else if ((HWND)lParam == st->hChangeLogBtn)
+	else if ((HWND)lParam == st->hProgramChangeLogBtn)
 	{
-		MessageBeep(MB_ICONASTERISK);
-		const int r = MessageBoxW(
-			hwnd,
-			L"Clear Log and Load Change Log?",
-			L"MapPack Sync Tool",
-			MB_OKCANCEL | MB_ICONQUESTION
-		);
-		if (r == IDOK)
+		if (ConfirmClearLogAndLoad(hwnd, L"Program Change Log"))
 		{
-			LoadRemoteChangeLogIntoOutput(st);
+			LoadRemoteProgramChangeLogIntoOutput(st);
+		}
+	}
+	else if ((HWND)lParam == st->hMappackChangeLogBtn)
+	{
+		if (ConfirmClearLogAndLoad(hwnd, L"Mappack Change Log"))
+		{
+			LoadRemoteMappackChangeLogIntoOutput(st);
 		}
 	}
 	else if ((HWND)lParam == st->hAboutBtn)
 	{
-		MessageBeep(MB_ICONASTERISK);
-		const int r = MessageBoxW(
-			hwnd,
-			L"Clear Log and Load About / System Info?",
-			L"MapPack Sync Tool",
-			MB_OKCANCEL | MB_ICONQUESTION
-		);
-		if (r == IDOK)
+		if (ConfirmClearLogAndLoad(hwnd, L"About / System Info"))
 		{
 			ShowAboutSystemInfoDialog(hwnd);
 		}
 	}
 	else if ((HWND)lParam == st->hHelpBtn)
 	{
-		MessageBeep(MB_ICONASTERISK);
-		const int r = MessageBoxW(
-			hwnd,
-			L"Clear Log and Load Help?",
-			L"MapPack Sync Tool",
-			MB_OKCANCEL | MB_ICONQUESTION
-		);
-		if (r == IDOK)
+		if (ConfirmClearLogAndLoad(hwnd, L"Help"))
 		{
 			st->logActionsArmed = false;
 			UpdateHelpButtonEnabled(st);
@@ -6827,7 +6884,7 @@ static LRESULT HandleWmAppUpdateResult(AppState* st, HWND hwnd, LPARAM lParam)
 		{
 			st->isUpdateRunning.store(false);
 			UpdateCheckUpdatesButtonEnabled(st);
-			UpdateChangeLogButtonEnabled(st);
+			UpdateChangeLogButtonsEnabled(st);
 			if (st->hUpdateThread) { CloseHandle(st->hUpdateThread); st->hUpdateThread = nullptr; }
 		}
 
@@ -7058,6 +7115,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	{
 		g_pendingAutoAction = PendingAutoAction::ChangeLog;
 	}
+	else if (argv && argc >= 2 && _wcsicmp(argv[1], L"--auto-mappack-changelog") == 0)
+	{
+		g_pendingAutoAction = PendingAutoAction::MappackChangeLog;
+	}
 	if (argv) LocalFree(argv);
 	// Enforce single instance for normal GUI mode.
 	if (!AcquireSingleInstanceMutex())
@@ -7117,7 +7178,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	g_state->hFolderEdit = CreateWindowW(
 		L"EDIT", L"",
 		WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-		190, 12, 410, 22,
+		188, 12, 652, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 
 	// Load last folder from portable INI (if present).
@@ -7141,58 +7202,63 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	g_state->hBrowseBtn = CreateWindowW(
 		L"BUTTON", L"Browse...",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		620, 12, 80, 22,
+		848, 12, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hPreferencesBtn = CreateWindowW(
 		L"BUTTON", L"Preferences",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 92, 22,
+		948, 12, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hRunButton = CreateWindowW(
 		L"BUTTON", L"Add / Sync",
 		WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-		690, 12, 60, 22,
+		10, 44, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hCancelBtn = CreateWindowW(
 		L"BUTTON", L"Cancel Sync",
 		WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
-		755, 12, 60, 22,
+		110, 44, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hDeleteBtn = CreateWindowW(
 		L"BUTTON", L"Remove",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 130, 22,
+		210, 44, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 
 	g_state->hCopyLogBtn = CreateWindowW(
 		L"BUTTON", L"Copy Log",
 		WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
-		0, 0, 92, 22,
+		848, 44, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hSaveLogBtn = CreateWindowW(
 		L"BUTTON", L"Save Log...",
 		WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_PUSHBUTTON,
-		0, 0, 92, 22,
+		948, 44, 92, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hCheckUpdatesBtn = CreateWindowW(
 		L"BUTTON", L"Check for Updates",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 130, 22,
+		310, 44, 128, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
-	g_state->hChangeLogBtn = CreateWindowW(
-		L"BUTTON", L"Change Log",
+	g_state->hProgramChangeLogBtn = CreateWindowW(
+		L"BUTTON", L"Change Log: Program",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 92, 22,
+		444, 44, 160, 22,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
+	g_state->hMappackChangeLogBtn = CreateWindowW(
+		L"BUTTON", L"Change Log: Mappack",
+		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+		610, 44, 160, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hHelpBtn = CreateWindowW(
 		L"BUTTON", L"?",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 22, 22,
+		782, 44, 22, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hAboutBtn = CreateWindowW(
 		L"BUTTON", L"i",
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-		0, 0, 22, 22,
+		810, 44, 22, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	// --------------------------------------------------
 	// PROGRESS BAR (FIXED: create WITHOUT PBS_MARQUEE)
@@ -7200,21 +7266,19 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	g_state->hProgress = CreateWindowExW(
 		0, PROGRESS_CLASSW, nullptr,
 		WS_CHILD | WS_VISIBLE | PBS_SMOOTH, // <-- no PBS_MARQUEE here
-		10, 42, 800, 14,
+		10, 74, 1030, 14,
 		g_state->hMainWnd, (HMENU)2001, hInst, nullptr);
 	SendMessageW(g_state->hProgress, PBM_SETRANGE32, 0, 1);
 	SendMessageW(g_state->hProgress, PBM_SETPOS, 0, 0);
 	g_state->hProgressText = CreateWindowExW(
 		WS_EX_CLIENTEDGE, L"STATIC", L"Ready",
 		WS_CHILD | WS_VISIBLE,
-		10, 60, 800, 22,
+		10, 92, 1030, 22,
 		g_state->hMainWnd, (HMENU)2002, hInst, nullptr);
 	g_state->hOutput = CreateWindowExW(
 		0, L"RICHEDIT50W", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
 		ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY,
-		OUTPUT_MARGIN_LEFT, OUTPUT_MARGIN_TOP,
-		MAIN_WINDOW_WIDTH - OUTPUT_MARGIN_LEFT - OUTPUT_MARGIN_RIGHT,
-		MAIN_WINDOW_HEIGHT - OUTPUT_MARGIN_TOP - OUTPUT_MARGIN_BOTTOM,
+		10, 122, 1030, 706,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
 	UpdateLogActionButtonsEnabled(g_state);
 	UpdateHelpButtonEnabled(g_state);
@@ -7266,8 +7330,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		AddTooltip(g_state->hTooltip, g_state->hSaveLogBtn, L"Save Log to a .txt file");
 		AddTooltip(g_state->hTooltip, g_state->hHelpBtn, L"Reload Help (Also displays upon startup)");
 		AddTooltip(g_state->hTooltip, g_state->hAboutBtn, L"Show diagnostic system information");
-		AddTooltip(g_state->hTooltip, g_state->hCheckUpdatesBtn, L"Check for updates of MapPack Sync Tool");
-		AddTooltip(g_state->hTooltip, g_state->hChangeLogBtn, L"Download and display Change Log");
+		AddTooltip(g_state->hTooltip, g_state->hCheckUpdatesBtn, L"Check for program updates");
+		AddTooltip(g_state->hTooltip, g_state->hProgramChangeLogBtn, L"Download and display Program Change Log");
+		AddTooltip(g_state->hTooltip, g_state->hMappackChangeLogBtn, L"Download and display Mappack Change Log");
 	}
 	LayoutMainWindow(g_state->hMainWnd, g_state);
 	SendMessageW(g_state->hOutput, EM_EXLIMITTEXT, 0, (LPARAM)(8ULL * 1024ULL * 1024ULL));
@@ -7323,7 +7388,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 	}
 	else if (g_pendingAutoAction == PendingAutoAction::ChangeLog)
 	{
-		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hChangeLogBtn);
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hProgramChangeLogBtn);
+	}
+	else if (g_pendingAutoAction == PendingAutoAction::MappackChangeLog)
+	{
+		PostMessageW(g_state->hMainWnd, WM_COMMAND, 0, (LPARAM)g_state->hMappackChangeLogBtn);
 	}
 	else
 	{
