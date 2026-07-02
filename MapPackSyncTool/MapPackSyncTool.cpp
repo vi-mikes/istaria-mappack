@@ -874,7 +874,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	int updateX = deleteX + btnW + groupGap - 20;
 	int programChangeLogX = updateX + updateW + 6;
 	int mappackChangeLogX = programChangeLogX + programChangeLogW + 6;
-	int helpX = mappackChangeLogX + mappackChangeLogW + 12;
+	int helpX = mappackChangeLogX + mappackChangeLogW + 14;
 	int aboutX = helpX + helpW + 6;
 
 	int saveLogX = right - btnW;
