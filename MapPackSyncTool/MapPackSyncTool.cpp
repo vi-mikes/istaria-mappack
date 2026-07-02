@@ -4301,7 +4301,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		return;
 	}
 
-	Log("Success!");
+	Log("Success!\r\n");
 	LogSeparator();
 	Log("MapPack 4.0 Clean-up: Searching files that exists AND are in the manifest (Needs deleted) ...\r\n");
 
@@ -4351,7 +4351,7 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		Log("  Failed deletions: " + std::to_string(failed) + "\r\n");
 	}
 	else
-		Log("  No files found that needs deleted.");
+		Log("  No files found that needs deleted.\r\n");
 
 
 	if (!cancel.IsCanceled())
