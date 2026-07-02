@@ -187,7 +187,7 @@ static constexpr const wchar_t* kLegacyUpdaterExeFileName = L"MapPackSyncTool_Up
 // --------------------------------------------------
 // Global UI layout (initial size + margins)
 // --------------------------------------------------
-static const int MAIN_WINDOW_WIDTH = 850;  // initial window width
+static const int MAIN_WINDOW_WIDTH = 1050;  // initial window width
 static const int MAIN_WINDOW_HEIGHT = 860;   // initial window height
 // RichEdit margins (client area)
 static const int OUTPUT_MARGIN_LEFT = 10;
@@ -293,6 +293,7 @@ struct AppState
 	HWND hSaveLogBtn = nullptr;
 	HWND hCheckUpdatesBtn = nullptr;
 	HWND hChangeLogBtn = nullptr;
+	HWND hPreferencesBtn = nullptr;
 	HWND hHelpBtn = nullptr;
 	HWND hAboutBtn = nullptr;
 	HWND hFolderEdit = nullptr;
@@ -350,6 +351,10 @@ static bool IsCurrentProcessElevated();
 static std::wstring BuildCurrentCommandLineArgumentsForRelaunch();
 static void ReleaseSingleInstanceMutex();
 static void ShowAboutSystemInfoDialog(HWND owner);
+static void ShowPreferencesDialog(HWND owner);
+static void ShowExclusionsDialog(HWND owner);
+static bool IsPathExcluded(const fs::path& path);
+static bool IsExcludedOrContainsExcludedPath(const fs::path& dir);
 
 // --------------------------------------------------
 // Settings persistence (portable INI next to EXE)
@@ -363,6 +368,9 @@ static const wchar_t* kIniKeyTermsAccepted = L"TermsAccepted";
 static const wchar_t* kIniKeyTermsVersion = L"TermsVersion";
 static const wchar_t* kIniSectionManifest = L"Manifest";
 static const wchar_t* kIniKeyManifestSha256 = L"LastSyncedManifestSha256";
+static const wchar_t* kIniSectionPreferences = L"Preferences";
+static const wchar_t* kIniKeyExclusionCount = L"ExclusionCount";
+static const wchar_t* kIniKeyExclusionPrefix = L"Exclusion";
 // Should I ever come out with new Terms of Use, then increment below line by one number.
 // This will show user latest terms and force them to Accept the latest terms of use again; Hence updating [License] TermsVersion in the .ini file.
 static constexpr int kCurrentTermsVersion = 1;
@@ -645,6 +653,153 @@ static bool IniWriteLastSyncedManifestInfo(const std::string& sha256Lower, std::
 }
 
 
+static std::wstring NormalizeExclusionPathForCompare(const fs::path& input)
+{
+	std::error_code ec;
+	fs::path p = input;
+
+	if (p.empty())
+		return L"";
+
+	p = fs::absolute(p, ec);
+	if (ec)
+	{
+		ec.clear();
+		p = input;
+	}
+
+	fs::path canon = fs::weakly_canonical(p, ec);
+	if (!ec && !canon.empty())
+		p = canon;
+
+	std::wstring s = p.wstring();
+	while (!s.empty() && (s.back() == L'\\' || s.back() == L'/'))
+		s.pop_back();
+
+	std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) { return (wchar_t)towlower(ch); });
+	return s;
+}
+
+static std::wstring MakeIniExclusionKey(size_t index)
+{
+	return std::wstring(kIniKeyExclusionPrefix) + std::to_wstring(index);
+}
+
+static std::vector<fs::path> IniReadExclusions()
+{
+	std::vector<fs::path> out;
+	const std::wstring iniPath = GetSettingsIniPath();
+	const UINT count = GetPrivateProfileIntW(kIniSectionPreferences, kIniKeyExclusionCount, 0, iniPath.c_str());
+
+	for (UINT i = 1; i <= count; ++i)
+	{
+		wchar_t buf[32768]{};
+		const std::wstring key = MakeIniExclusionKey(i);
+		GetPrivateProfileStringW(kIniSectionPreferences, key.c_str(), L"", buf, (DWORD)_countof(buf), iniPath.c_str());
+		std::wstring v(buf);
+		TrimInPlace(v);
+		StripSurroundingQuotes(v);
+		if (!v.empty())
+			out.emplace_back(v);
+	}
+	return out;
+}
+
+static bool IniWriteExclusions(const std::vector<fs::path>& paths, std::wstring* outErr = nullptr)
+{
+	if (outErr) outErr->clear();
+	const std::wstring iniPath = GetSettingsIniPath();
+
+	const UINT oldCount = GetPrivateProfileIntW(kIniSectionPreferences, kIniKeyExclusionCount, 0, iniPath.c_str());
+	for (UINT i = 1; i <= oldCount; ++i)
+	{
+		const std::wstring key = MakeIniExclusionKey(i);
+		WritePrivateProfileStringW(kIniSectionPreferences, key.c_str(), nullptr, iniPath.c_str());
+	}
+
+	std::vector<std::wstring> normalizedSeen;
+	std::vector<fs::path> clean;
+	for (const fs::path& p : paths)
+	{
+		std::wstring cmp = NormalizeExclusionPathForCompare(p);
+		if (cmp.empty())
+			continue;
+		if (std::find(normalizedSeen.begin(), normalizedSeen.end(), cmp) != normalizedSeen.end())
+			continue;
+		normalizedSeen.push_back(cmp);
+		clean.push_back(p);
+	}
+
+	std::wstring err;
+	if (!IniWriteStringVerified(kIniSectionPreferences, kIniKeyExclusionCount, std::to_wstring(clean.size()), &err))
+	{
+		if (outErr) *outErr = err;
+		return false;
+	}
+
+	for (size_t i = 0; i < clean.size(); ++i)
+	{
+		const std::wstring key = MakeIniExclusionKey(i + 1);
+		if (!IniWriteStringVerified(kIniSectionPreferences, key.c_str(), clean[i].wstring(), &err))
+		{
+			if (outErr) *outErr = err;
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool IsPathEqualOrChildOf(const std::wstring& child, const std::wstring& parent)
+{
+	if (child.empty() || parent.empty())
+		return false;
+	if (child == parent)
+		return true;
+	if (child.size() <= parent.size())
+		return false;
+	if (child.compare(0, parent.size(), parent) != 0)
+		return false;
+	const wchar_t next = child[parent.size()];
+	return next == L'\\' || next == L'/';
+}
+
+static bool IsPathExcluded(const fs::path& path)
+{
+	const std::wstring target = NormalizeExclusionPathForCompare(path);
+	if (target.empty())
+		return false;
+
+	const std::vector<fs::path> exclusions = IniReadExclusions();
+	for (const fs::path& ex : exclusions)
+	{
+		const std::wstring cmp = NormalizeExclusionPathForCompare(ex);
+		if (cmp.empty())
+			continue;
+		if (IsPathEqualOrChildOf(target, cmp))
+			return true;
+	}
+	return false;
+}
+
+static bool IsExcludedOrContainsExcludedPath(const fs::path& dir)
+{
+	const std::wstring target = NormalizeExclusionPathForCompare(dir);
+	if (target.empty())
+		return false;
+
+	const std::vector<fs::path> exclusions = IniReadExclusions();
+	for (const fs::path& ex : exclusions)
+	{
+		const std::wstring cmp = NormalizeExclusionPathForCompare(ex);
+		if (cmp.empty())
+			continue;
+		if (IsPathEqualOrChildOf(target, cmp) || IsPathEqualOrChildOf(cmp, target))
+			return true;
+	}
+	return false;
+}
+
+
 struct CancelToken
 {
 	std::atomic_bool* flag = nullptr;
@@ -678,8 +833,9 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	const int btnH = ctrlH;
 	int right = cw - m;
 
-	// Folder row: keep Browse attached to the path field and anchored right.
-	int browseX = right - btnW;
+	// Folder row: Preferences is now the far-right button; Browse sits immediately to its left.
+	int preferencesX = right - btnW;
+	int browseX = preferencesX - gap - btnW;
 
 	int labelX = m;
 	int labelY = 15;
@@ -710,9 +866,9 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	// Group 2: information/actions.
 	// Group 3: log export buttons anchored to the far right.
 	int updateX = deleteX + btnW + groupGap;
-	int changeLogX = updateX + updateW + gap;
-	int helpX = changeLogX + changeLogW + gap;
-	int aboutX = helpX + helpW + gap;
+	int changeLogX = updateX + updateW + gap + 15;
+	int helpX = changeLogX + changeLogW + gap + 20;
+	int aboutX = helpX + helpW + gap + 10;
 
 	int saveLogX = right - btnW;
 	int copyLogX = saveLogX - gap - btnW;
@@ -730,6 +886,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 		if (st->hFolderLabel) MoveWindow(st->hFolderLabel, labelX, labelY, labelW, 20, TRUE);
 		if (st->hFolderEdit)  MoveWindow(st->hFolderEdit, editX, editY, editW, ctrlH, TRUE);
 		if (st->hBrowseBtn)   MoveWindow(st->hBrowseBtn, browseX, rowY, btnW, btnH, TRUE);
+		if (st->hPreferencesBtn) MoveWindow(st->hPreferencesBtn, preferencesX, rowY, btnW, btnH, TRUE);
 		if (st->hRunButton)   MoveWindow(st->hRunButton, runX, buttonRowY, btnW, btnH, TRUE);
 		if (st->hCancelBtn)   MoveWindow(st->hCancelBtn, cancelX, buttonRowY, btnW, btnH, TRUE);
 		if (st->hDeleteBtn)   MoveWindow(st->hDeleteBtn, deleteX, buttonRowY, btnW, btnH, TRUE);
@@ -752,6 +909,7 @@ static void LayoutMainWindow(HWND hwnd, AppState* st)
 	defer(st->hFolderLabel, labelX, labelY, labelW, 20);
 	defer(st->hFolderEdit, editX, editY, editW, ctrlH);
 	defer(st->hBrowseBtn, browseX, rowY, btnW, btnH);
+	defer(st->hPreferencesBtn, preferencesX, rowY, btnW, btnH);
 	defer(st->hRunButton, runX, buttonRowY, btnW, btnH);
 	defer(st->hCancelBtn, cancelX, buttonRowY, btnW, btnH);
 	defer(st->hDeleteBtn, deleteX, buttonRowY, btnW, btnH);
@@ -1126,6 +1284,7 @@ namespace helpers
 
 		// Disable everything except Cancel while running.
 		EnableCtl(st->hBrowseBtn, !running);
+		EnableCtl(st->hPreferencesBtn, !running);
 		EnableCtl(st->hRunButton, !running);
 		EnableCtl(st->hDeleteBtn, !running);
 		EnableCtl(st->hFolderEdit, !running);
@@ -3896,6 +4055,11 @@ static EmptyDirRemovalStats RemoveEmptyDirsBottomUp(const fs::path& root, bool r
 		});
 	for (const auto& d : dirs)
 	{
+		if (IsExcludedOrContainsExcludedPath(d))
+		{
+			ec.clear();
+			continue;
+		}
 		if (fs::is_directory(d, ec) && fs::is_empty(d, ec))
 		{
 			ec.clear();
@@ -3918,6 +4082,11 @@ static EmptyDirRemovalStats RemoveEmptyDirsBottomUp(const fs::path& root, bool r
 	}
 	if (removeRoot)
 	{
+		if (IsExcludedOrContainsExcludedPath(root))
+		{
+			ec.clear();
+			return stats;
+		}
 		if (fs::is_directory(root, ec) && fs::is_empty(root, ec))
 		{
 			ec.clear();
@@ -3950,6 +4119,11 @@ static void UpdateClientPrefsMapPath(const SyncConfig& cfg, const CancelToken& c
 	try
 	{
 		const fs::path prefsFile = cfg.localBase / "prefs" / "ClientPrefs_Common.def";
+		if (IsPathExcluded(prefsFile))
+		{
+			Log(std::string("\\prefs\\ClientPrefs_Common.def check: EXCLUSION SKIPPED: ") + PathToUtf8(prefsFile) + "\r\n");
+			return;
+		}
 		if (!fs::exists(prefsFile))
 		{
 			Log(std::string("\\prefs\\ClientPrefs_Common.def check: file not found: ") + PathToUtf8(prefsFile) + "\r\n");
@@ -4146,6 +4320,12 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 		ec.clear();
 		if (!fs::is_regular_file(local, ec) || ec) continue;
 
+		if (IsPathExcluded(local))
+		{
+			Log("  EXCLUSION SKIPPED: " + PathToUtf8(local) + "\r\n");
+			continue;
+		}
+
 		ec.clear();
 		fs::remove(local, ec);
 		if (!ec)
@@ -4198,12 +4378,24 @@ static void RemoveOldManifestListedFiles(const SyncConfig& cfg, const CancelToke
 // --------------------------------------------------
 // Folder picker
 // --------------------------------------------------
-static bool BrowseForFolder(HWND hwnd, std::wstring& outPath)
+static int CALLBACK BrowseFolderInitialSelectionCallback(HWND hwnd, UINT msg, LPARAM, LPARAM data)
+{
+	if (msg == BFFM_INITIALIZED && data)
+		SendMessageW(hwnd, BFFM_SETSELECTIONW, TRUE, data);
+	return 0;
+}
+
+static bool BrowseForFolder(HWND hwnd, std::wstring& outPath, const std::wstring& initialFolder = L"")
 {
 	BROWSEINFO bi{};
 	bi.hwndOwner = hwnd;
 	bi.lpszTitle = L"Select Istaria install folder (must contain istaria.exe)";
 	bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+	if (!initialFolder.empty())
+	{
+		bi.lpfn = BrowseFolderInitialSelectionCallback;
+		bi.lParam = (LPARAM)initialFolder.c_str();
+	}
 	PIDLIST_ABSOLUTE pidl = SHBrowseForFolder(&bi);
 	if (!pidl) return false;
 	std::vector<wchar_t> pathBuf(32768, L'\0');
@@ -4233,6 +4425,7 @@ struct SyncCounters
 	size_t updated = 0;
 	size_t unchanged = 0;
 	size_t failed = 0;
+	size_t skippedExcluded = 0;
 };
 struct ManifestData
 {
@@ -4302,6 +4495,7 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 	if (cancel.IsCanceled()) return;
 	size_t failedDeletes = 0;
 	size_t filesDeleted = 0;
+	size_t skippedExcluded = 0;
 
 	LogSeparator();
 	Log("MapPack 5.0 Clean-up: Searching files that exist but are NOT in the manifest (Needs deleted) ...\r\n");
@@ -4330,6 +4524,13 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 		std::string rel = NormalizeManifestRel(relPathFs.generic_string());
 		if (manifestRelSet.find(rel) == manifestRelSet.end())
 		{
+			if (IsPathExcluded(fullPath))
+			{
+				++skippedExcluded;
+				Log("  EXCLUSION SKIPPED: " + PathToUtf8(fullPath) + "\r\n");
+				continue;
+			}
+
 			std::error_code ec;
 			if (fs::remove(fullPath, ec))
 			{
@@ -4343,13 +4544,15 @@ static void DeleteLocalFilesNotInManifest(const SyncConfig& cfg,
 			}
 		}
 	}
-	if (filesDeleted == 0 && failedDeletes == 0)
+	if (filesDeleted == 0 && failedDeletes == 0 && skippedExcluded == 0)
 		Log("  No files found that needs deleted.\r\n");
 	else
 	{
 		Log("\r\nFile Delete Summary:\r\n");
 		Log("  Deletions:  " + std::to_string(filesDeleted) + "\r\n");
 		Log("  Failed deletions:  " + std::to_string(failedDeletes) + "\r\n");
+		if (skippedExcluded > 0)
+			Log("  Exclusions Skipped:  " + std::to_string(skippedExcluded) + "\r\n");
 	}
 }
 static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md, SyncCounters& ioCounts, const CancelToken& cancel)
@@ -4372,6 +4575,12 @@ static void DownloadAndUpdateFiles(const SyncConfig& cfg, const ManifestData& md
 		} };
 		PostProgressTextW(MakeProgressFileLabel(L"File", i + 1, md.workList.size(), rel, &remotePath));
 		fs::path localFile = MakeDestPath(cfg.localBase, rel);
+		if (IsPathExcluded(localFile))
+		{
+			++ioCounts.skippedExcluded;
+			Log("  EXCLUSION SKIPPED: resources_override/mappack/" + rel + "\r\n");
+			continue;
+		}
 		if (fs::exists(localFile))
 		{
 			std::string localHash;
@@ -4421,6 +4630,8 @@ static void LogSummaryAndCleanup(const SyncConfig& cfg, const SyncCounters& c, c
 	Log("    Downloaded (missing):  " + std::to_string(c.downloaded) + "\r\n");
 	Log("    Updated (different):  " + std::to_string(c.updated) + "\r\n");
 	Log("    Unchanged (same):  " + std::to_string(c.unchanged) + "\r\n");
+	if (c.skippedExcluded > 0)
+		Log("    Exclusions Skipped:  " + std::to_string(c.skippedExcluded) + "\r\n");
 	Log("    Failed Downloads/Updates:  " + std::to_string(c.failed) + "\r\n");
 }
 static void RunSync(const SyncConfig& cfg, const CancelToken& cancel)
@@ -4520,6 +4731,7 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 	size_t deleted = 0;
 	size_t missing = 0;
 	size_t failed = 0;
+	size_t skippedExcluded = 0;
 
 	for (size_t i = 0; i < md.workList.size(); ++i)
 	{
@@ -4530,6 +4742,13 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 		ScopeExit progressGuard{ [i]() { PostProgressSet(i + 1); } };
 		PostProgressTextW(MakeProgressFileLabel(L"Removing", i + 1, md.workList.size(), rel, nullptr));
 		fs::path localFile = MakeDestPath(cfg.localBase, rel);
+		if (IsPathExcluded(localFile))
+		{
+			++skippedExcluded;
+			Log("  EXCLUSION SKIPPED: resources_override/mappack/" + rel + "\r\n");
+			continue;
+		}
+
 		std::error_code ec;
 		if (!fs::exists(localFile, ec) || ec)
 		{
@@ -4549,13 +4768,15 @@ static void RemoveMapPackFiles(const SyncConfig& cfg, const CancelToken& cancel)
 		}
 	}
 
-	if (deleted > 0 || failed > 0)
+	if (deleted > 0 || failed > 0 || skippedExcluded > 0)
 		Log("\r\n"); //Add blank line
 
 	Log("MapPack 5.0 Deleted Files Summary:\r\n");
 	Log("  Deletions:  " + std::to_string(deleted) + "\r\n");
 	Log("  File doesn't exist (already removed):  " + std::to_string(missing) + "\r\n");
 	Log("  Failed deletions:  " + std::to_string(failed) + "\r\n");
+	if (skippedExcluded > 0)
+		Log("  Exclusions Skipped:  " + std::to_string(skippedExcluded) + "\r\n");
 
 	if (IsCanceledNoNotify(cancel)) return;
 	LogSeparator();
@@ -6102,13 +6323,364 @@ static bool LoadRemoteChangeLogIntoOutput(AppState* st)
 	return true;
 }
 
+
+
+struct PreferencesDialogState
+{
+	HWND hWnd = nullptr;
+	HWND hList = nullptr;
+	HWND hAddFile = nullptr;
+	HWND hAddFolder = nullptr;
+	HWND hRemove = nullptr;
+	HWND hClose = nullptr;
+	std::vector<fs::path> exclusions;
+};
+
+static void PreferencesReloadList(PreferencesDialogState* ps)
+{
+	if (!ps || !ps->hList) return;
+	SendMessageW(ps->hList, LB_RESETCONTENT, 0, 0);
+	for (const fs::path& p : ps->exclusions)
+		SendMessageW(ps->hList, LB_ADDSTRING, 0, (LPARAM)p.wstring().c_str());
+}
+
+static bool PreferencesAddPath(PreferencesDialogState* ps, const fs::path& p)
+{
+	if (!ps || p.empty()) return false;
+	std::vector<fs::path> tmp = ps->exclusions;
+	tmp.push_back(p);
+	std::wstring err;
+	if (!IniWriteExclusions(tmp, &err))
+	{
+		MessageBoxW(ps->hWnd, err.c_str(), L"Exclusions", MB_OK | MB_ICONERROR);
+		return false;
+	}
+	ps->exclusions = IniReadExclusions();
+	PreferencesReloadList(ps);
+	return true;
+}
+
+static std::wstring GetExclusionsInitialFolder()
+{
+	std::wstring lastFolder = IniReadLastFolder();
+	TrimInPlace(lastFolder);
+	StripSurroundingQuotes(lastFolder);
+	if (lastFolder.empty())
+		return L"";
+
+	std::error_code ec;
+	fs::path resourcesInterface = fs::path(lastFolder) / L"resources_override" / L"mappack" / L"resources" / L"interface";
+	if (fs::exists(resourcesInterface, ec) && fs::is_directory(resourcesInterface, ec))
+		return resourcesInterface.wstring();
+
+	ec.clear();
+	fs::path resourcesRoot = fs::path(lastFolder) / L"resources_override" / L"mappack" / L"resources";
+	if (fs::exists(resourcesRoot, ec) && fs::is_directory(resourcesRoot, ec))
+		return resourcesRoot.wstring();
+
+	ec.clear();
+	fs::path mapPackRoot = fs::path(lastFolder) / L"resources_override" / L"mappack";
+	if (fs::exists(mapPackRoot, ec) && fs::is_directory(mapPackRoot, ec))
+		return mapPackRoot.wstring();
+
+	return lastFolder;
+}
+
+static void PreferencesAddFile(PreferencesDialogState* ps)
+{
+	if (!ps) return;
+	wchar_t fileName[MAX_PATH]{};
+	OPENFILENAMEW ofn{};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = ps->hWnd;
+	ofn.lpstrFile = fileName;
+	ofn.nMaxFile = (DWORD)_countof(fileName);
+	ofn.lpstrTitle = L"Select file to exclude";
+	ofn.lpstrFilter = L"All Files\0*.*\0\0";
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	std::wstring initialDir = GetExclusionsInitialFolder();
+	if (!initialDir.empty())
+		ofn.lpstrInitialDir = initialDir.c_str();
+	if (GetOpenFileNameW(&ofn))
+		PreferencesAddPath(ps, fs::path(fileName));
+}
+
+static void PreferencesAddFolder(PreferencesDialogState* ps)
+{
+	if (!ps) return;
+	std::wstring initialFolder = GetExclusionsInitialFolder();
+	BROWSEINFOW bi{};
+	bi.hwndOwner = ps->hWnd;
+	bi.lpszTitle = L"Select folder to exclude";
+	bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+	if (!initialFolder.empty())
+	{
+		bi.lpfn = BrowseFolderInitialSelectionCallback;
+		bi.lParam = (LPARAM)initialFolder.c_str();
+	}
+	PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+	if (!pidl) return;
+	wchar_t path[MAX_PATH]{};
+	if (SHGetPathFromIDListW(pidl, path))
+		PreferencesAddPath(ps, fs::path(path));
+	CoTaskMemFree(pidl);
+}
+
+static void PreferencesRemoveSelected(PreferencesDialogState* ps)
+{
+	if (!ps || !ps->hList) return;
+	int sel = (int)SendMessageW(ps->hList, LB_GETCURSEL, 0, 0);
+	if (sel == LB_ERR || sel < 0 || (size_t)sel >= ps->exclusions.size()) return;
+	ps->exclusions.erase(ps->exclusions.begin() + sel);
+	std::wstring err;
+	if (!IniWriteExclusions(ps->exclusions, &err))
+	{
+		MessageBoxW(ps->hWnd, err.c_str(), L"Exclusions", MB_OK | MB_ICONERROR);
+		return;
+	}
+	ps->exclusions = IniReadExclusions();
+	PreferencesReloadList(ps);
+}
+
+static LRESULT CALLBACK PreferencesWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	PreferencesDialogState* ps = (PreferencesDialogState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	switch (msg)
+	{
+	case WM_CREATE:
+	{
+		CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+		ps = (PreferencesDialogState*)cs->lpCreateParams;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)ps);
+		ps->hWnd = hwnd;
+		HFONT uiFont = g_state ? g_state->hFontUI : nullptr;
+
+		HWND hLabel = CreateWindowW(L"STATIC", L"Excluded files and folders:", WS_CHILD | WS_VISIBLE,
+			10, 10, 560, 20, hwnd, nullptr, nullptr, nullptr);
+
+		ps->hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+			WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY,
+			10, 35, 910, 220, hwnd, nullptr, nullptr, nullptr);
+
+		ps->hAddFile = CreateWindowW(L"BUTTON", L"Add File...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			10, 270, 105, 24, hwnd, (HMENU)1001, nullptr, nullptr);
+		ps->hAddFolder = CreateWindowW(L"BUTTON", L"Add Folder...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			125, 270, 105, 24, hwnd, (HMENU)1002, nullptr, nullptr);
+		ps->hRemove = CreateWindowW(L"BUTTON", L"Remove Selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			240, 270, 130, 24, hwnd, (HMENU)1003, nullptr, nullptr);
+		// Keep Close separated from the action buttons and aligned near the right edge
+		// of the wider Exclusions window.
+		ps->hClose = CreateWindowW(L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+			815, 270, 105, 24, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+
+		if (uiFont)
+		{
+			SendMessageW(hLabel, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hList, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hAddFile, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hAddFolder, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hRemove, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hClose, WM_SETFONT, (WPARAM)uiFont, TRUE);
+		}
+
+		ps->exclusions = IniReadExclusions();
+		PreferencesReloadList(ps);
+		return 0;
+	}
+	case WM_COMMAND:
+		switch (LOWORD(wParam))
+		{
+		case 1001: PreferencesAddFile(ps); return 0;
+		case 1002: PreferencesAddFolder(ps); return 0;
+		case 1003: PreferencesRemoveSelected(ps); return 0;
+		case IDCANCEL: DestroyWindow(hwnd); return 0;
+		}
+		break;
+	case WM_CLOSE:
+		DestroyWindow(hwnd);
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+
+enum class PreferencesHubAction
+{
+	None = 0,
+	OpenExclusions,
+};
+
+struct PreferencesHubDialogState
+{
+	HWND hWnd = nullptr;
+	HWND hExclusions = nullptr;
+	HWND hClose = nullptr;
+	HWND hTooltip = nullptr;
+	PreferencesHubAction requestedAction = PreferencesHubAction::None;
+};
+
+static LRESULT CALLBACK PreferencesHubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	PreferencesHubDialogState* ps = (PreferencesHubDialogState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	switch (msg)
+	{
+	case WM_CREATE:
+	{
+		CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+		ps = (PreferencesHubDialogState*)cs->lpCreateParams;
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)ps);
+		ps->hWnd = hwnd;
+
+		HFONT uiFont = g_state ? g_state->hFontUI : nullptr;
+
+		ps->hExclusions = CreateWindowW(
+			L"BUTTON", L"Exclusions List",
+			WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			20, 18, 130, 26,
+			hwnd, (HMENU)2001, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+
+		ps->hTooltip = CreateWindowExW(
+			WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+			WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+			CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+			hwnd, nullptr, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+		if (ps->hTooltip)
+		{
+			SetWindowPos(ps->hTooltip, HWND_TOPMOST, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+			AddTooltip(ps->hTooltip, ps->hExclusions, L"View or modify the list of files/folders excluded from syncing.");
+		}
+
+		ps->hClose = CreateWindowW(
+			L"BUTTON", L"Close",
+			WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+			210, 112, 90, 26,
+			hwnd, (HMENU)IDCANCEL, ((LPCREATESTRUCTW)lParam)->hInstance, nullptr);
+
+		if (uiFont)
+		{
+			SendMessageW(ps->hExclusions, WM_SETFONT, (WPARAM)uiFont, TRUE);
+			SendMessageW(ps->hClose, WM_SETFONT, (WPARAM)uiFont, TRUE);
+		}
+		return 0;
+	}
+	case WM_COMMAND:
+		switch (LOWORD(wParam))
+		{
+		case 2001:
+			if (ps) ps->requestedAction = PreferencesHubAction::OpenExclusions;
+			DestroyWindow(hwnd);
+			return 0;
+		case IDCANCEL:
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		break;
+	case WM_CLOSE:
+		DestroyWindow(hwnd);
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowPreferencesDialog(HWND owner)
+{
+	static bool registered = false;
+	HINSTANCE hInst = (HINSTANCE)GetModuleHandleW(nullptr);
+	if (!registered)
+	{
+		WNDCLASSW wc{};
+		wc.lpfnWndProc = PreferencesHubWndProc;
+		wc.hInstance = hInst;
+		wc.lpszClassName = L"MapPackSyncToolPreferencesHubWindow";
+		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+		wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+		RegisterClassW(&wc);
+		registered = true;
+	}
+
+	PreferencesHubDialogState ps{};
+	HWND hwnd = CreateWindowExW(
+		WS_EX_DLGMODALFRAME,
+		L"MapPackSyncToolPreferencesHubWindow",
+		L"Preferences",
+		WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+		CW_USEDEFAULT, CW_USEDEFAULT, 340, 190,
+		owner, nullptr, hInst, &ps);
+	if (!hwnd) return;
+
+	EnableWindow(owner, FALSE);
+	MSG msg{};
+	while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+	{
+		if (!IsDialogMessageW(hwnd, &msg))
+		{
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+	const PreferencesHubAction requestedAction = ps.requestedAction;
+	if (requestedAction == PreferencesHubAction::OpenExclusions)
+	{
+		ShowExclusionsDialog(owner);
+	}
+
+	EnableWindow(owner, TRUE);
+	SetActiveWindow(owner);
+}
+
+static void ShowExclusionsDialog(HWND owner)
+{
+	static bool registered = false;
+	HINSTANCE hInst = (HINSTANCE)GetModuleHandleW(nullptr);
+	if (!registered)
+	{
+		WNDCLASSW wc{};
+		wc.lpfnWndProc = PreferencesWndProc;
+		wc.hInstance = hInst;
+		wc.lpszClassName = L"MapPackSyncToolExclusionsWindow";
+		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+		wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+		RegisterClassW(&wc);
+		registered = true;
+	}
+
+	PreferencesDialogState ps{};
+	HWND hwnd = CreateWindowExW(
+		WS_EX_DLGMODALFRAME,
+		L"MapPackSyncToolExclusionsWindow",
+		L"Exclusions",
+		WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+		CW_USEDEFAULT, CW_USEDEFAULT, 950, 345,
+		owner, nullptr, hInst, &ps);
+	if (!hwnd) return;
+
+	EnableWindow(owner, FALSE);
+	MSG msg{};
+	while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+	{
+		if (!IsDialogMessageW(hwnd, &msg))
+		{
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+	EnableWindow(owner, TRUE);
+	SetActiveWindow(owner);
+}
+
 static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lParam)
 {
 
 	if ((HWND)lParam == st->hBrowseBtn)
 	{
 		std::wstring path;
-		if (BrowseForFolder(hwnd, path))
+		std::wstring initialFolder = st && st->hFolderEdit ? GetTextCtl(st->hFolderEdit) : L"";
+		TrimInPlace(initialFolder);
+		StripSurroundingQuotes(initialFolder);
+		if (initialFolder.empty())
+			initialFolder = IniReadLastFolder();
+		if (BrowseForFolder(hwnd, path, initialFolder))
 		{
 			SetTextCtl(st->hFolderEdit, path.c_str());
 			// Persist selection for next launch (INI created on first write).
@@ -6117,6 +6689,10 @@ static LRESULT HandleWmCommand(AppState* st, HWND hwnd, WPARAM wParam, LPARAM lP
 				std::wstring iniErr; if (!IniWriteLastFolder(path, &iniErr)) Log("WARNING: Failed to save last folder to MapPackSyncTool.ini: " + WideToUtf8(iniErr) + "\r\n");
 			}
 		}
+	}
+	else if ((HWND)lParam == st->hPreferencesBtn)
+	{
+		ShowPreferencesDialog(hwnd);
 	}
 	else if ((HWND)lParam == st->hRunButton)
 	{
@@ -6567,6 +7143,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 		620, 12, 80, 22,
 		g_state->hMainWnd, nullptr, hInst, nullptr);
+	g_state->hPreferencesBtn = CreateWindowW(
+		L"BUTTON", L"Preferences",
+		WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+		0, 0, 92, 22,
+		g_state->hMainWnd, nullptr, hInst, nullptr);
 	g_state->hRunButton = CreateWindowW(
 		L"BUTTON", L"Add / Sync",
 		WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
@@ -6676,6 +7257,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ i
 		SendMessageW(g_state->hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 4000);
 		SendMessageW(g_state->hTooltip, TTM_ACTIVATE, TRUE, 0);
 		AddTooltip(g_state->hTooltip, g_state->hBrowseBtn, L"Browse/Select your Istaria Root Game Folder");
+		AddTooltip(g_state->hTooltip, g_state->hPreferencesBtn, L"Manage files and folders excluded from Add / Sync and Remove");
 		AddTooltip(g_state->hTooltip, g_state->hRunButton, L"Download/Update/Sync/Install MapPack 5.0");
 		AddTooltip(g_state->hTooltip, g_state->hCancelBtn, L"Cancel current action");
 		AddTooltip(g_state->hTooltip, g_state->hDeleteBtn, L"Remove/Uninstall MapPack 5.0 (or Older 4.0 versions)");
